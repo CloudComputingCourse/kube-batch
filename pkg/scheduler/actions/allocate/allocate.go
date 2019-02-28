@@ -1,5 +1,5 @@
 /*
-Copyright 2017 The Kubernetes Authors.
+Copyright 2018 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,11 +17,14 @@ limitations under the License.
 package allocate
 
 import (
+	"k8s.io/apimachinery/pkg/labels"
+
 	"github.com/golang/glog"
 
 	"github.com/kubernetes-incubator/kube-arbitrator/pkg/scheduler/api"
 	"github.com/kubernetes-incubator/kube-arbitrator/pkg/scheduler/framework"
-	"github.com/kubernetes-incubator/kube-arbitrator/pkg/scheduler/util"
+
+	"math"
 )
 
 type allocateAction struct {
@@ -39,96 +42,155 @@ func (alloc *allocateAction) Name() string {
 func (alloc *allocateAction) Initialize() {}
 
 func (alloc *allocateAction) Execute(ssn *framework.Session) {
-	glog.V(3).Infof("Enter Allocate ...")
-	defer glog.V(3).Infof("Leaving Allocate ...")
+	glog.V(3).Infof("Enter Allocate...")
+	defer glog.V(3).Infof("Leaving Allocate...")
 
-	jobs := util.NewPriorityQueue(ssn.JobOrderFn)
+	// Load configuration of policy
+	policyConf := ssn.GetPolicy("kube-system/scheduler-conf")
+	glog.V(3).Infof("Using policy %v.", policyConf)
 
+	policyFn := fifoRandomFn
+	switch policyConf {
+	case "fifoRandom":
+		policyFn = fifoRandomFn
+	case "fifoHeter":
+		policyFn = fifoHeterFn
+	case "sjfHeter":
+		policyFn = sjfHeterFn
+	case "custom":
+		policyFn = customFn
+	}
+
+	// Prepare job queue
+	jobs := []*api.JobInfo{}
+	minRequired := math.MaxInt32
+	var t *api.TaskInfo
 	for _, job := range ssn.Jobs {
-		jobs.Push(job)
+		if len(job.TaskStatusIndex[api.Pending]) >= job.MinAvailable {
+			jobs = append(jobs, job)
+			if len(job.TaskStatusIndex[api.Pending]) < minRequired {
+				minRequired = len(job.TaskStatusIndex[api.Pending])
+			}
+			if t == nil {
+				for _, task := range job.TaskStatusIndex[api.Pending] {
+					t = task
+					break
+				}
+			}
+		} else {
+			glog.V(3).Infof("Job <%v, %v> has %v tasks pending but requires %v tasks.",
+				job.Namespace, job.Name, len(job.TaskStatusIndex[api.Pending]), job.MinAvailable)
+		}
 	}
 
-	glog.V(3).Infof("Try to allocate resource to %d Jobs", jobs.Len())
+	if len(jobs) == 0 {
+		glog.V(3).Infof("No jobs awaiting, skipping policy")
+		return
+	}
 
-	pendingTasks := map[api.JobID]*util.PriorityQueue{}
+	glog.V(3).Infof("%v jobs awaiting:", len(jobs))
+	for _, job := range jobs {
+		glog.V(3).Infof("    <%v/%v>", job.Namespace, job.Name)
+	}
 
-	for {
-		if jobs.Empty() {
-			break
+	// Prepare node info
+	nodes := []*api.NodeInfo{}
+	nodeCount := 0
+	selector := labels.SelectorFromSet(labels.Set(map[string]string{"type": "virtual-kubelet"}))
+	for _, node := range ssn.Nodes {
+		if selector.Matches(labels.Set(node.Node.Labels)) {
+			nodes = append(nodes, node)
+			if t.Resreq.LessEqual(node.Idle) {
+				nodeCount = nodeCount + 1
+			}
 		}
+	}
 
-		job := jobs.Pop().(*api.JobInfo)
+	glog.V(3).Infof("%v/%v nodes available:", nodeCount, len(nodes))
+	for _, node := range nodes {
+		glog.V(3).Infof("    <%v>", node.Name)
+	}
 
-		if _, found := pendingTasks[job.UID]; !found {
-			tasks := util.NewPriorityQueue(ssn.TaskOrderFn)
+	if nodeCount < minRequired {
+		glog.V(3).Infof("Not enough node (%v) for any job (%v), skipping policy", nodeCount, minRequired)
+		return
+	}
+
+	// Call policy function to get allocation for first job
+	allocation := policyFn(jobs, nodes)
+
+	for len(allocation) != 0 {
+
+		// Check allocation to get a clean (possible) placement
+		cleaned := make(map[*api.TaskInfo]*api.NodeInfo)
+		used := make(map[*api.NodeInfo]bool)
+		for idx, job := range jobs {
+			allocated := true
+			first := true
+			tempused := make(map[*api.NodeInfo]bool)
 			for _, task := range job.TaskStatusIndex[api.Pending] {
-				tasks.Push(task)
-			}
-			pendingTasks[job.UID] = tasks
-		}
-		tasks := pendingTasks[job.UID]
-
-		glog.V(3).Infof("Try to allocate resource to %d tasks of Job <%v/%v>",
-			tasks.Len(), job.Namespace, job.Name)
-
-		for !tasks.Empty() {
-			task := tasks.Pop().(*api.TaskInfo)
-
-			assigned := false
-
-			// TODO (k82cn): Enable eCache for performance improvement.
-			var nodes []*api.NodeInfo
-			for _, node := range ssn.Nodes {
-				if err := ssn.PredicateFn(task, node); err == nil {
-					nodes = append(nodes, node)
-				} else {
-					glog.V(3).Infof("Predicates failed for task <%s/%s> on node <%s>: %v",
-						task.Namespace, task.Name, node.Name, err)
+				node, ok := allocation[task]
+				if ok && (!task.Resreq.LessEqual(node.Idle) || used[node] || tempused[node]) {
+					glog.Errorf("Not enough idle resource on %v to bind Task <%v/%v> in Session %v",
+						node.Name, task.Namespace, task.Name, ssn.UID)
+					ok = false
 				}
-			}
-
-			glog.V(3).Infof("There are <%d> nodes for Job <%v/%v>",
-				len(nodes), job.Namespace, job.Name)
-
-			for _, node := range nodes {
-				glog.V(3).Infof("Considering Task <%v/%v> on node <%v>: <%v> vs. <%v>",
-					task.Namespace, task.Name, node.Name, task.Resreq, node.Idle)
-				// Allocate idle resource to the task.
-				if task.Resreq.LessEqual(node.Idle) {
-					glog.V(3).Infof("Binding Task <%v/%v> to node <%v>",
-						task.Namespace, task.Name, node.Name)
-					if err := ssn.Allocate(task, node.Name); err != nil {
-						glog.Errorf("Failed to bind Task %v on %v in Session %v",
-							task.UID, node.Name, ssn.UID)
-						continue
-					}
-					assigned = true
+				if !ok && !first && allocated {
+					allocated = false
+					glog.Errorf("Job <%v/%v> partially allocated, ignored", job.Namespace, job.Name)
+					break
+				} else if !ok {
+					allocated = false
+				} else if !allocated {
+					glog.Errorf("Job <%v/%v> partially allocated, ignored", job.Namespace, job.Name)
 					break
 				}
-
-				// Allocate releasing resource to the task if any.
-				if task.Resreq.LessEqual(node.Releasing) {
-					glog.V(3).Infof("Pipelining Task <%v/%v> to node <%v> for <%v> on <%v>",
-						task.Namespace, task.Name, node.Name, task.Resreq, node.Releasing)
-					if err := ssn.Pipeline(task, node.Name); err != nil {
-						glog.Errorf("Failed to pipeline Task %v on %v in Session %v",
-							task.UID, node.Name, ssn.UID)
-						continue
-					}
-
-					assigned = true
-					break
+				tempused[node] = true
+				first = false
+			}
+			if allocated {
+				for _, task := range job.TaskStatusIndex[api.Pending] {
+					cleaned[task] = allocation[task]
+					used[allocation[task]] = true
 				}
+				jobs = append(jobs[: idx], jobs[idx + 1 :]...)
+				nodeCount = nodeCount - len(cleaned)
+				glog.Infof("Exactly 1 job found in allocation, ignoring the rest (if any)")
+				break; // Allocate tasks of one job at a time
 			}
-
-			if assigned {
-				jobs.Push(job)
-			}
-
-			// Handle one pending task in each loop.
-			break
 		}
+
+		// Allocate tasks
+		for task, node := range cleaned {
+			glog.V(3).Infof("Try to bind Task <%v/%v> to Node <%v>: <%v> vs. <%v>",
+				task.Namespace, task.Name, node.Name, task.Resreq, node.Idle)
+
+			// Allocate idle resource to the task.
+			glog.V(3).Infof("Binding Task <%v/%v> to node <%v>",
+				task.Namespace, task.Name, node.Name)
+			if err := ssn.Allocate(task, node.Name); err != nil {
+				glog.Errorf("Failed to bind Task %v on %v in Session %v",
+					task.UID, node.Name, ssn.UID)
+			} else {
+				ssn.UpdateScheduledTime(task)
+			}
+		}
+
+		glog.V(3).Infof("%v jobs awaiting:", len(jobs))
+		for _, job := range jobs {
+			glog.V(3).Infof("    <%v/%v>", job.Namespace, job.Name)
+		}
+
+		glog.V(3).Infof("%v/%v nodes available:", nodeCount, len(nodes))
+		for _, node := range nodes {
+			glog.V(3).Infof("    <%v>", node.Name)
+		}
+
+		// Call policy function to get allocation for next job
+		allocation = policyFn(jobs, nodes)
+
 	}
+
 }
 
 func (alloc *allocateAction) UnInitialize() {}

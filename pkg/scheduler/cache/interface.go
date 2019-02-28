@@ -42,6 +42,8 @@ type Cache interface {
 	Bind(task *api.TaskInfo, hostname string) error
 
 	Evict(task *api.TaskInfo) error
+
+	UpdateScheduledTime(task *api.TaskInfo) error
 }
 
 type Binder interface {
