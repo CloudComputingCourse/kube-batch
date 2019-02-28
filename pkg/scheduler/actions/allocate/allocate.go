@@ -24,7 +24,6 @@ import (
 	"github.com/kubernetes-incubator/kube-arbitrator/pkg/scheduler/api"
 	"github.com/kubernetes-incubator/kube-arbitrator/pkg/scheduler/framework"
 
-	"math"
 	"strconv"
 	"os"
 	"fmt"
@@ -70,7 +69,7 @@ func (alloc *allocateAction) Name() string {
 
 func (alloc *allocateAction) Initialize() {}
 
-func prepareInput(jobs []*api.JobInfo, nodes []*api.NodeInfo, nodesAvailable map[int]*api.NodeInfo) InputT {
+func prepareInput(jobs []*api.JobInfo, nodes []*api.NodeInfo, nodesAvailable map[string]*api.NodeInfo) InputT {
 	var input InputT
 
 	// Collect rack capacities and number of GPU racks from node info
@@ -112,8 +111,9 @@ func prepareInput(jobs []*api.JobInfo, nodes []*api.NodeInfo, nodesAvailable map
 	}
 
 	// Collect node info
-	for nodeID, _ := range nodesAvailable {
-		input.Machines = append(input.Machines, nodeID)
+	for nodeName, _ := range nodesAvailable {
+		nodeID, _ := strconv.ParseInt(nodeName[3 :], 10, 64)
+		input.Machines = append(input.Machines, int(nodeID))
 	}
 
 	return input
@@ -141,15 +141,11 @@ func (alloc *allocateAction) Execute(ssn *framework.Session) {
 
 	// Prepare job queue
 	jobs := []*api.JobInfo{}
-	minRequired := math.MaxInt32
 	var trace string
 	var t *api.TaskInfo
 	for _, job := range ssn.Jobs {
 		if len(job.TaskStatusIndex[api.Pending]) >= job.MinAvailable {
 			jobs = append(jobs, job)
-			if len(job.TaskStatusIndex[api.Pending]) < minRequired {
-				minRequired = len(job.TaskStatusIndex[api.Pending])
-			}
 			if t == nil {
 				for _, task := range job.TaskStatusIndex[api.Pending] {
 					trace = task.Pod.ObjectMeta.Labels["trace"]
@@ -174,26 +170,29 @@ func (alloc *allocateAction) Execute(ssn *framework.Session) {
 
 	// Prepare node info
 	nodes := []*api.NodeInfo{}
-	nodesAvailable := make(map[int]*api.NodeInfo)
+	nodesAvailable := make(map[string]*api.NodeInfo)
 	selector := labels.SelectorFromSet(labels.Set(map[string]string{"type": "virtual-kubelet"}))
 	for _, node := range ssn.Nodes {
 		if selector.Matches(labels.Set(node.Node.Labels)) {
 			nodes = append(nodes, node)
 			if t.Resreq.LessEqual(node.Idle) {
-				nodeIdx, _ := strconv.ParseInt(node.Node.ObjectMeta.Name[3 :], 10, 64)
-				nodesAvailable[int(nodeIdx)] = node
+				nodesAvailable[node.Node.ObjectMeta.Name] = node
 			}
 		}
 	}
 
-	glog.V(3).Infof("%v/%v nodes available:", len(nodesAvailable), len(nodes))
-	for _, node := range nodes {
-		glog.V(3).Infof("    <%v>", node.Name)
+	if len(nodesAvailable) <= 0 {
+		glog.V(3).Infof("No nodes available, skipping policy")
+		return
 	}
 
-	if len(nodesAvailable) < minRequired {
-		glog.V(3).Infof("Not enough node (%v) for any job (%v), skipping policy", len(nodesAvailable), minRequired)
-		return
+	glog.V(3).Infof("%v/%v nodes available:", len(nodesAvailable), len(nodes))
+	for _, node := range nodes {
+		if _, found := nodesAvailable[node.Name]; found {
+			glog.V(3).Infof("    <%v>: available", node.Name)
+		} else {
+			glog.V(3).Infof("    <%v>", node.Name)
+		}
 	}
 
 	// Prepare policy input for grader json
@@ -240,7 +239,7 @@ func (alloc *allocateAction) Execute(ssn *framework.Session) {
 					output.Machines = append(output.Machines, int(nodeID))
 					cleaned[task] = allocation[task]
 					used[allocation[task]] = true
-					delete(nodesAvailable, int(nodeID))
+					delete(nodesAvailable, allocation[task].Node.ObjectMeta.Name)
 				}
 				jobs = append(jobs[: idx], jobs[idx + 1 :]...)
 				glog.Infof("Exactly 1 job found in allocation, ignoring the rest (if any)")
@@ -255,16 +254,8 @@ func (alloc *allocateAction) Execute(ssn *framework.Session) {
 			message.Output = output
 		}
 		b, _ := json.Marshal(message)
-		var traceFile *os.File
-		if fi, err := os.Stat(fmt.Sprintf("/tmp/trace-%s.json", trace)); err == nil {
-			traceFile, _ = os.OpenFile(fmt.Sprintf("/tmp/trace-%s.json", trace), os.O_WRONLY, 0644)
-			traceFile.Seek(fi.Size() - 1, 0)
-			traceFile.Write([]byte(","))
-		} else if os.IsNotExist(err) {
-			traceFile, _ = os.Create(fmt.Sprintf("/tmp/trace-%s.json", trace))
-			traceFile.Write([]byte("["))
-		}
-		traceFile.Write(append(b, ']'))
+		traceFile, _ := os.OpenFile(fmt.Sprintf("/tmp/trace-%s.json", trace), os.O_APPEND | os.O_CREATE | os.O_WRONLY, 0644)
+		traceFile.Write(append(b, ','))
 		traceFile.Close()
 
 		// Allocate tasks
@@ -283,14 +274,28 @@ func (alloc *allocateAction) Execute(ssn *framework.Session) {
 			}
 		}
 
+		if len(jobs) == 0 {
+			glog.V(3).Infof("No jobs awaiting, skipping policy")
+			return
+		}
+
 		glog.V(3).Infof("%v jobs awaiting:", len(jobs))
 		for _, job := range jobs {
 			glog.V(3).Infof("    <%v/%v>", job.Namespace, job.Name)
 		}
 
+		if len(nodesAvailable) <= 0 {
+			glog.V(3).Infof("No nodes available, skipping policy")
+			return
+		}
+
 		glog.V(3).Infof("%v/%v nodes available:", len(nodesAvailable), len(nodes))
 		for _, node := range nodes {
-			glog.V(3).Infof("    <%v>", node.Name)
+			if _, found := nodesAvailable[node.Name]; found {
+				glog.V(3).Infof("    <%v>: available", node.Name)
+			} else {
+				glog.V(3).Infof("    <%v>", node.Name)
+			}
 		}
 
 		// Prepare policy input for grader json
@@ -300,6 +305,14 @@ func (alloc *allocateAction) Execute(ssn *framework.Session) {
 		allocation = policyFn(jobs, nodes)
 
 	}
+
+	// Marshal policy input and empty output to json and write to file
+	var message Message
+	message.Input = input
+	b, _ := json.Marshal(message)
+	traceFile, _ := os.OpenFile(fmt.Sprintf("/tmp/trace-%s.json", trace), os.O_APPEND | os.O_CREATE | os.O_WRONLY, 0644)
+	traceFile.Write(append(b, ','))
+	traceFile.Close()
 
 }
 
