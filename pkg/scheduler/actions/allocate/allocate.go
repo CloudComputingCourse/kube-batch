@@ -18,11 +18,13 @@ package allocate
 
 import (
 	"k8s.io/apimachinery/pkg/labels"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/golang/glog"
 
 	"github.com/kubernetes-incubator/kube-arbitrator/pkg/scheduler/api"
 	"github.com/kubernetes-incubator/kube-arbitrator/pkg/scheduler/framework"
+	"github.com/kubernetes-incubator/kube-arbitrator/pkg/scheduler/util"
 
 	"strconv"
 	"os"
@@ -68,6 +70,29 @@ func (alloc *allocateAction) Name() string {
 }
 
 func (alloc *allocateAction) Initialize() {}
+
+func jobOrderFn(l, r interface{}) int {
+	lv := l.(*api.JobInfo)
+	rv := r.(*api.JobInfo)
+	lc := metav1.Now()
+	rc := metav1.Now()
+	for _, lt := range lv.TaskStatusIndex[api.Pending] {
+		if lt.Pod.ObjectMeta.CreationTimestamp.Before(&lc) {
+			lc = lt.Pod.ObjectMeta.CreationTimestamp
+		}
+	}
+	for _, rt := range rv.TaskStatusIndex[api.Pending] {
+		if rt.Pod.ObjectMeta.CreationTimestamp.Before(&rc) {
+			rc = rt.Pod.ObjectMeta.CreationTimestamp
+		}
+	}
+	if lc.Before(&rc) {
+		glog.V(3).Infof("%s (%v) before %s (%v)", lv.Name, lc, rv.Name, rc)
+		return -1
+	}
+		glog.V(3).Infof("%s (%v) before %s (%v)", rv.Name, rc, lv.Name, lc)
+	return 1
+}
 
 func prepareInput(jobs []*api.JobInfo, nodes []*api.NodeInfo, nodesAvailable map[string]*api.NodeInfo) InputT {
 	var input InputT
@@ -140,16 +165,18 @@ func (alloc *allocateAction) Execute(ssn *framework.Session) {
 	}
 
 	// Prepare job queue
-	jobs := []*api.JobInfo{}
+	ssn.AddJobOrderFn(jobOrderFn)
+	jobQueue := util.NewPriorityQueue(ssn.JobOrderFn)
 	var trace string
 	var t *api.TaskInfo
 	for _, job := range ssn.Jobs {
 		if len(job.TaskStatusIndex[api.Pending]) >= job.MinAvailable {
-			jobs = append(jobs, job)
+			jobQueue.Push(job)
 			if t == nil {
 				for _, task := range job.TaskStatusIndex[api.Pending] {
 					trace = task.Pod.ObjectMeta.Labels["trace"]
 					t = task
+					break
 				}
 			}
 		} else {
@@ -158,9 +185,18 @@ func (alloc *allocateAction) Execute(ssn *framework.Session) {
 		}
 	}
 
-	if len(jobs) == 0 {
+	if jobQueue.Empty() {
 		glog.V(3).Infof("No jobs awaiting, skipping policy")
 		return
+	}
+
+	jobs := []*api.JobInfo{}
+	for {
+		job := jobQueue.Pop()
+		jobs = append(jobs, job.(*api.JobInfo))
+		if jobQueue.Empty() {
+			break
+		}
 	}
 
 	glog.V(3).Infof("%v jobs awaiting:", len(jobs))
