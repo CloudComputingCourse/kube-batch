@@ -30,6 +30,7 @@ import (
 	"os"
 	"fmt"
 	"encoding/json"
+	"reflect"
 )
 
 type JobT struct {
@@ -143,6 +144,11 @@ func prepareInput(jobs []*api.JobInfo, nodes []*api.NodeInfo, nodesAvailable map
 
 	return input
 }
+
+// keep track of jobs/nodes in the previous allocation decision
+var prevJobs []*api.JobInfo
+var prevNodes []*api.NodeInfo
+
 
 func (alloc *allocateAction) Execute(ssn *framework.Session) {
 	glog.V(3).Infof("Enter Allocate...")
@@ -289,10 +295,23 @@ func (alloc *allocateAction) Execute(ssn *framework.Session) {
 		if len(output.Machines) != 0 {
 			message.Output = output
 		}
-		b, _ := json.Marshal(message)
-		traceFile, _ := os.OpenFile(fmt.Sprintf("/tmp/trace-%s.json", trace), os.O_APPEND | os.O_CREATE | os.O_WRONLY, 0644)
-		traceFile.Write(append(b, ','))
-		traceFile.Close()
+		// save only if message is different than the previous one
+		if (!reflect.DeepEqual(jobs,prevJobs)) && (!reflect.DeepEqual(nodes,prevNodes)) {
+			jobsInfo := []string{}
+			for _,job  := range(jobs) {
+				jobsInfo = append(jobsInfo, job.Name)
+			}
+			glog.Infof("Allocation decision recorded for %v", jobsInfo)
+			b, _ := json.Marshal(message)
+			traceFile, _ := os.OpenFile(fmt.Sprintf("/tmp/trace-%s.json", trace), os.O_APPEND | os.O_CREATE | os.O_WRONLY, 0644)
+			traceFile.Write(append(b, ','))
+			traceFile.Close()
+		} else {
+			glog.Infof("Same jobs/nodes, not recording allocation decision")
+		}
+		// remember jobs/nodes, to avoid saving identical (empty) scheduling decisions
+		prevJobs = jobs
+		prevNodes = nodes
 
 		// Allocate tasks
 		for task, node := range cleaned {
@@ -345,11 +364,23 @@ func (alloc *allocateAction) Execute(ssn *framework.Session) {
 	// Marshal policy input and empty output to json and write to file
 	var message Message
 	message.Input = input
-	b, _ := json.Marshal(message)
-	traceFile, _ := os.OpenFile(fmt.Sprintf("/tmp/trace-%s.json", trace), os.O_APPEND | os.O_CREATE | os.O_WRONLY, 0644)
-	traceFile.Write(append(b, ','))
-	traceFile.Close()
-
+	// save only if message is different than the previous one
+	if (!reflect.DeepEqual(jobs,prevJobs)) && (!reflect.DeepEqual(nodes,prevNodes)) {
+		jobsInfo := []string{}
+		for _,job  := range(jobs) {
+			jobsInfo = append(jobsInfo, job.Name)
+		}
+		glog.Infof("Empty allocation decision recorded for %v", jobsInfo)
+		b, _ := json.Marshal(message)
+		traceFile, _ := os.OpenFile(fmt.Sprintf("/tmp/trace-%s.json", trace), os.O_APPEND | os.O_CREATE | os.O_WRONLY, 0644)
+		traceFile.Write(append(b, ','))
+		traceFile.Close()
+	} else {
+		glog.Infof("Same jobs/nodes, not recording empty allocation decision")
+	}
+	// remember jobs/nodes, to avoid saving identical (empty) scheduling decisions
+	prevJobs = jobs
+	prevNodes = nodes
 }
 
 func (alloc *allocateAction) UnInitialize() {}
