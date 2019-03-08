@@ -278,7 +278,7 @@ func (alloc *allocateAction) Execute(ssn *framework.Session) {
 					delete(nodesAvailable, allocation[task].Node.ObjectMeta.Name)
 				}
 				jobs = append(jobs[: idx], jobs[idx + 1 :]...)
-				glog.Infof("Exactly 1 job found in allocation, ignoring the rest (if any)")
+				glog.Infof("Job allocated [JobID=%v]: %v", jobID, output.Machines)
 				break; // Allocate tasks of one job at a time
 			}
 		}
