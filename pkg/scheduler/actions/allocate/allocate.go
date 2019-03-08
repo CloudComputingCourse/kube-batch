@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"encoding/json"
 	"reflect"
+	"sort"
 )
 
 type JobT struct {
@@ -186,8 +187,13 @@ func (alloc *allocateAction) Execute(ssn *framework.Session) {
 				}
 			}
 		} else {
-			glog.V(3).Infof("Job <%v, %v> has %v tasks pending but requires %v tasks.",
-				job.Namespace, job.Name, len(job.TaskStatusIndex[api.Pending]), job.MinAvailable)
+			numPending := len(job.TaskStatusIndex[api.Pending])
+			var severe glog.Level
+			if numPending>0 { // partial allocation, shouldn't happen
+				severe = 2
+			}
+			glog.V(3-severe).Infof("Job <%v, %v> has %v tasks pending but requires %v tasks.",
+				job.Namespace, job.Name, numPending, job.MinAvailable)
 		}
 	}
 
@@ -249,6 +255,7 @@ func (alloc *allocateAction) Execute(ssn *framework.Session) {
 		// Check allocation to get a clean (possible) placement
 		cleaned := make(map[*api.TaskInfo]*api.NodeInfo)
 		used := make(map[*api.NodeInfo]bool)
+		var allocatedJobId int
 		for idx, job := range jobs {
 			allocated := true
 			first := true
@@ -274,7 +281,8 @@ func (alloc *allocateAction) Execute(ssn *framework.Session) {
 				first = false
 			}
 			if allocated {
-				jobID, _ := strconv.ParseInt(job.Name[4 :], 10, 64)
+				//jobID, _ := strconv.ParseInt(job.Name[4 :], 10, 64)
+				jobID, _ := strconv.Atoi(job.Name[4 :])
 				output.JobID = int(jobID)
 				for _, task := range job.TaskStatusIndex[api.Pending] {
 					nodeID, _ := strconv.ParseInt(allocation[task].Node.ObjectMeta.Name[3 :], 10, 64)
@@ -283,8 +291,10 @@ func (alloc *allocateAction) Execute(ssn *framework.Session) {
 					used[allocation[task]] = true
 					delete(nodesAvailable, allocation[task].Node.ObjectMeta.Name)
 				}
+				// removing job #idx from jobs
 				jobs = append(jobs[: idx], jobs[idx + 1 :]...)
 				glog.Infof("Job allocated [JobID=%v]: %v", jobID, output.Machines)
+				allocatedJobId = jobID
 				break; // Allocate tasks of one job at a time
 			}
 		}
@@ -295,13 +305,19 @@ func (alloc *allocateAction) Execute(ssn *framework.Session) {
 		if len(output.Machines) != 0 {
 			message.Output = output
 		}
-		// save only if message is different than the previous one
-		if (!reflect.DeepEqual(jobs,prevJobs)) && (!reflect.DeepEqual(nodes,prevNodes)) {
+		// save only if jobs/nodes are different than before
+		if (!reflect.DeepEqual(jobs,prevJobs)) || (!reflect.DeepEqual(nodes,prevNodes)) {
 			jobsInfo := []string{}
 			for _,job  := range(jobs) {
-				jobsInfo = append(jobsInfo, job.Name)
+				jobsInfo = append(jobsInfo, job.Name[4:])
 			}
-			glog.Infof("Allocation decision recorded for %v", jobsInfo)
+			sort.Strings(jobsInfo)
+			nodesInfo := []string{}
+			for _,node  := range(nodes) {
+				nodesInfo = append(nodesInfo, node.Name[3:])
+			}
+			sort.Strings(nodesInfo)
+			glog.Infof("Allocation decision recorded for %v (queue: %v, nodes:%v)", allocatedJobId, jobsInfo, nodesInfo)
 			b, _ := json.Marshal(message)
 			traceFile, _ := os.OpenFile(fmt.Sprintf("/tmp/trace-%s.json", trace), os.O_APPEND | os.O_CREATE | os.O_WRONLY, 0644)
 			traceFile.Write(append(b, ','))
@@ -368,15 +384,21 @@ func (alloc *allocateAction) Execute(ssn *framework.Session) {
 	if (!reflect.DeepEqual(jobs,prevJobs)) && (!reflect.DeepEqual(nodes,prevNodes)) {
 		jobsInfo := []string{}
 		for _,job  := range(jobs) {
-			jobsInfo = append(jobsInfo, job.Name)
+			jobsInfo = append(jobsInfo, job.Name[4:])
 		}
-		glog.Infof("Empty allocation decision recorded for %v", jobsInfo)
+		sort.Strings(jobsInfo)
+		nodesInfo := []string{}
+		for _,node  := range(nodes) {
+			nodesInfo = append(nodesInfo, node.Name[3:])
+		}
+		sort.Strings(nodesInfo)
+		glog.Infof("Empty allocation decision recorded (queue: %v, nodes: %v)", jobsInfo, nodesInfo)
 		b, _ := json.Marshal(message)
 		traceFile, _ := os.OpenFile(fmt.Sprintf("/tmp/trace-%s.json", trace), os.O_APPEND | os.O_CREATE | os.O_WRONLY, 0644)
 		traceFile.Write(append(b, ','))
 		traceFile.Close()
 	} else {
-		glog.Infof("Same jobs/nodes, not recording empty allocation decision")
+		glog.V(3).Infof("Same jobs/nodes, not recording empty allocation decision")
 	}
 	// remember jobs/nodes, to avoid saving identical (empty) scheduling decisions
 	prevJobs = jobs
