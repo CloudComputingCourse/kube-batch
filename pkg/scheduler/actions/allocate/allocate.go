@@ -266,8 +266,6 @@ func (alloc *allocateAction) Execute(ssn *framework.Session) {
 			break
 		}
 
-		nothingScheduled = false
-
 		// Validate allocation returned by the policy
 		var jobAllocated *api.JobInfo
 		var jobAllocatedIdx int
@@ -278,6 +276,7 @@ func (alloc *allocateAction) Execute(ssn *framework.Session) {
 			for _, task := range job.TaskStatusIndex[api.Pending] {
 				node, taskAllocated := allocation[task]
 				if taskAllocated { // task found in allocation
+					nothingScheduled = false
 					if jobAllocated == nil {
 						jobAllocated = job // we found the job
 						jobAllocatedIdx = idx
@@ -318,17 +317,22 @@ func (alloc *allocateAction) Execute(ssn *framework.Session) {
 				break // no need to check other jobs
 			}
 		}
+
+		if jobAllocated == nil {
+			// returned allocation does not contain tasks of a valid job from the queue
+			// no point to retry with the same inputs - exit the loop
+			break
+		}
+
 		// prepare output for grader
 		var output OutputT
-		if jobAllocated != nil {
-			output.JobID = jobNum(jobAllocated)
-			// find nodes in the returned allocation that belong to <jobAllocated>
-			for _, task := range jobAllocated.TaskStatusIndex[api.Pending] {
-				node, found := allocation[task]
-				if found {
-					nodeID := nodeNum(node.Node.ObjectMeta.Name)
-					output.Machines = append(output.Machines, nodeID)
-				}
+		output.JobID = jobNum(jobAllocated)
+		// find nodes in the returned allocation that belong to <jobAllocated>
+		for _, task := range jobAllocated.TaskStatusIndex[api.Pending] {
+			node, found := allocation[task]
+			if found {
+				nodeID := nodeNum(node.Node.ObjectMeta.Name)
+				output.Machines = append(output.Machines, nodeID)
 			}
 		}
 
@@ -336,7 +340,6 @@ func (alloc *allocateAction) Execute(ssn *framework.Session) {
 		recordDecision(input,output,trace)
 
 		if validAllocation {
-			allocated := false
 			// Allocate tasks
 			for task, node := range allocation {
 				glog.V(3).Infof("Try to bind Task <%v/%v> to Node <%v>: <%v> vs. <%v>",
@@ -346,17 +349,15 @@ func (alloc *allocateAction) Execute(ssn *framework.Session) {
 						task.UID, node.Name, ssn.UID)
 				} else {
 					ssn.UpdateScheduledTime(task)
-					// if we succeeded with at least one task, we shouldn't try scheduling this job again
-					allocated = true
 					// update nodesAvailable for next iteration
 					delete(nodesAvailable, node.Name)
 				}
 			}
-			if allocated {
-				// Update jobs for next iteration
-				jobs = append(jobs[:jobAllocatedIdx], jobs[jobAllocatedIdx+1:]...)
-			}
 		}
+
+		// remove the allocated job from the list passed to the policy in the next loop iteration
+		// if allocation was not valid, the job will be considered again next time Execute() is called
+		jobs = append(jobs[:jobAllocatedIdx], jobs[jobAllocatedIdx+1:]...)
 
 		// if no more jobs or nodes, exit the loop
 		if len(jobs) == 0 {
