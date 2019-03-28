@@ -116,7 +116,7 @@ func (cc *Controller) Run(stopCh <-chan struct{}) {
 
 	cache.WaitForCacheSync(stopCh, cc.queueJobSynced, cc.podSynced)
 
-	go wait.Until(cc.worker, time.Second, stopCh)
+	go wait.Until(cc.worker, 100 * time.MilliSecond, stopCh)
 }
 
 func (cc *Controller) addQueueJob(obj interface{}) {
@@ -208,49 +208,51 @@ func (cc *Controller) enqueue(obj interface{}) {
 }
 
 func (cc *Controller) worker() {
-	if _, err := cc.eventQueue.Pop(func(obj interface{}) error {
-		var queuejob *arbv1.QueueJob
-		switch v := obj.(type) {
-		case *arbv1.QueueJob:
-			queuejob = v
-		case *v1.Pod:
-			queuejobs, err := cc.queueJobLister.List(labels.Everything())
-			if err != nil {
-				glog.Errorf("Failed to list QueueJobs for Pod %v/%v", v.Namespace, v.Name)
-			}
-
-			ctl := utils.GetController(v)
-			for _, qj := range queuejobs {
-				if qj.UID == ctl {
-					queuejob = qj
-					break
+	for ; ; {
+		if _, err := cc.eventQueue.Pop(func(obj interface{}) error {
+			var queuejob *arbv1.QueueJob
+			switch v := obj.(type) {
+			case *arbv1.QueueJob:
+				queuejob = v
+			case *v1.Pod:
+				queuejobs, err := cc.queueJobLister.List(labels.Everything())
+				if err != nil {
+					glog.Errorf("Failed to list QueueJobs for Pod %v/%v", v.Namespace, v.Name)
 				}
+
+				ctl := utils.GetController(v)
+				for _, qj := range queuejobs {
+					if qj.UID == ctl {
+						queuejob = qj
+						break
+					}
+				}
+
+			default:
+				glog.Errorf("Un-supported type of %v", obj)
+				return nil
 			}
 
-		default:
-			glog.Errorf("Un-supported type of %v", obj)
-			return nil
-		}
+			if queuejob == nil {
+				if acc, err := meta.Accessor(obj); err != nil {
+					glog.Warningf("Failed to get QueueJob for %v/%v", acc.GetNamespace(), acc.GetName())
+				}
 
-		if queuejob == nil {
-			if acc, err := meta.Accessor(obj); err != nil {
-				glog.Warningf("Failed to get QueueJob for %v/%v", acc.GetNamespace(), acc.GetName())
+				return nil
+			}
+
+			// sync Pods for a QueueJob
+			if err := cc.syncQueueJob(queuejob); err != nil {
+				glog.Errorf("Failed to sync QueueJob %s, err %#v", queuejob.Name, err)
+				// If any error, requeue it.
+				return err
 			}
 
 			return nil
+		}); err != nil {
+			glog.Errorf("Fail to pop item from updateQueue, err %#v", err)
+			return
 		}
-
-		// sync Pods for a QueueJob
-		if err := cc.syncQueueJob(queuejob); err != nil {
-			glog.Errorf("Failed to sync QueueJob %s, err %#v", queuejob.Name, err)
-			// If any error, requeue it.
-			return err
-		}
-
-		return nil
-	}); err != nil {
-		glog.Errorf("Fail to pop item from updateQueue, err %#v", err)
-		return
 	}
 }
 
