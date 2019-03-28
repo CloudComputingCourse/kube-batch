@@ -214,22 +214,22 @@ func (cc *Controller) worker() {
 			switch v := obj.(type) {
 			case *arbv1.QueueJob:
 				queuejob = v
-			case *v1.Pod:
-				queuejobs, err := cc.queueJobLister.List(labels.Everything())
-				if err != nil {
-					glog.Errorf("Failed to list QueueJobs for Pod %v/%v", v.Namespace, v.Name)
-				}
-
-				ctl := utils.GetController(v)
-				for _, qj := range queuejobs {
-					if qj.UID == ctl {
-						queuejob = qj
-						break
-					}
-				}
+//			case *v1.Pod:
+//				queuejobs, err := cc.queueJobLister.List(labels.Everything())
+//				if err != nil {
+//					glog.Errorf("Failed to list QueueJobs for Pod %v/%v", v.Namespace, v.Name)
+//				}
+//
+//				ctl := utils.GetController(v)
+//				for _, qj := range queuejobs {
+//					if qj.UID == ctl {
+//						queuejob = qj
+//						break
+//					}
+//				}
 
 			default:
-				glog.Errorf("Un-supported type of %v", obj)
+//				glog.Errorf("Un-supported type of %v", obj)
 				return nil
 			}
 
