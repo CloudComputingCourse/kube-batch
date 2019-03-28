@@ -250,7 +250,7 @@ func (cc *Controller) worker() {
 
 			return nil
 		}); err != nil {
-			glog.Errorf("Fail to pop item from updateQueue, err %#v", err)
+			// glog.Errorf("Fail to pop item from updateQueue, err %#v", err)
 			return
 		}
 	}
