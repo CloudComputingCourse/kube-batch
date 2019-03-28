@@ -116,7 +116,7 @@ func (cc *Controller) Run(stopCh <-chan struct{}) {
 
 	cache.WaitForCacheSync(stopCh, cc.queueJobSynced, cc.podSynced)
 
-	go wait.Until(cc.worker, 100 * time.MilliSecond, stopCh)
+	go wait.Until(cc.worker, 100 * time.Millisecond, stopCh)
 }
 
 func (cc *Controller) addQueueJob(obj interface{}) {
