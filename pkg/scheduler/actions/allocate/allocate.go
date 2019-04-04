@@ -73,42 +73,62 @@ func (alloc *allocateAction) Name() string {
 
 func (alloc *allocateAction) Initialize() {}
 
+func addJobProperty(job *api.JobInfo) *api.JobInfo {
+	for _, task := range job.TaskStatusIndex[api.Pending] {
+		jobID, _ := strconv.ParseInt(job.Name[4 :], 10, 64)
+		job.ID = int(jobID)
+		job.Trace = task.Pod.ObjectMeta.Labels["trace"]
+		job.Type = task.Pod.ObjectMeta.Labels["type"]
+		fastDuration, _ := strconv.ParseInt(task.Pod.ObjectMeta.Labels["FastDuration"], 10, 64)
+		job.FastDuration = int(fastDuration)
+		slowDuration, _ := strconv.ParseInt(task.Pod.ObjectMeta.Labels["SlowDuration"], 10, 64)
+		job.SlowDuration = int(slowDuration)
+		break
+	}
+	job.CreationTime = metav1.Now()
+	for _, task := range job.TaskStatusIndex[api.Pending] {
+		if task.Pod.ObjectMeta.CreationTimestamp.Before(&job.CreationTime) {
+			job.CreationTime = task.Pod.ObjectMeta.CreationTimestamp
+		}
+	}
+	return job
+}
+
+func addNodeProperty(node *api.NodeInfo) *api.NodeInfo {
+	nodeID, _ := strconv.ParseInt(node.Node.ObjectMeta.Name[3 :], 10, 64)
+	node.ID = int(nodeID)
+	if rack, found := node.Node.ObjectMeta.Labels["Rack"]; found {
+		rackID, _ := strconv.ParseInt(rack, 10, 64)
+		node.Rack = int(rackID)
+	} else {
+		node.Rack = -1
+	}
+	if gpu, found := node.Node.ObjectMeta.Labels["GPU"]; found && gpu == "true" {
+		node.GPU = true
+	} else {
+		node.GPU = false
+	}
+	return node
+}
+
+func getOneTask(job *api.JobInfo) *api.TaskInfo {
+	for _, t := range job.TaskStatusIndex[api.Pending] {
+		return t
+	}
+	return nil
+}
+
 func jobOrderFn(l, r interface{}) int {
 	lv := l.(*api.JobInfo)
 	rv := r.(*api.JobInfo)
-	lc := metav1.Now()
-	rc := metav1.Now()
-	for _, lt := range lv.TaskStatusIndex[api.Pending] {
-		if lt.Pod.ObjectMeta.CreationTimestamp.Before(&lc) {
-			lc = lt.Pod.ObjectMeta.CreationTimestamp
-		}
-	}
-	for _, rt := range rv.TaskStatusIndex[api.Pending] {
-		if rt.Pod.ObjectMeta.CreationTimestamp.Before(&rc) {
-			rc = rt.Pod.ObjectMeta.CreationTimestamp
-		}
-	}
+	lc := lv.CreationTime
+	rc := rv.CreationTime
 	if lc.Before(&rc) {
 		glog.V(3).Infof("%s (%v) before %s (%v)", lv.Name, lc, rv.Name, rc)
 		return -1
 	}
-		glog.V(3).Infof("%s (%v) before %s (%v)", rv.Name, rc, lv.Name, lc)
+	glog.V(3).Infof("%s (%v) before %s (%v)", rv.Name, rc, lv.Name, lc)
 	return 1
-}
-
-func atoi(str string) int {
-	i,_ := strconv.Atoi(str)
-	return i
-}
-
-func jobNum(job *api.JobInfo) int {
-	// TODO: we assume that jobs are named 'job-NN'
-	return atoi(job.Name[4:])
-}
-
-func nodeNum(nodeName string) int {
-	// TODO: we assume that nodes are named 'vk-N'
-	return atoi(nodeName[3:])
 }
 
 func prepareInput(jobs []*api.JobInfo, nodes []*api.NodeInfo, nodesAvailable map[string]*api.NodeInfo) InputT {
@@ -117,16 +137,15 @@ func prepareInput(jobs []*api.JobInfo, nodes []*api.NodeInfo, nodesAvailable map
 	// Collect rack capacities and number of GPU racks from node info
 	rackCap := make(map[int]int)
 	for _, node := range nodes {
-		if rack, found := node.Node.ObjectMeta.Labels["Rack"]; found {
-			rackID, _ := strconv.Atoi(rack)
-			if _, found = rackCap[int(rackID)]; found {
-				rackCap[int(rackID)] = rackCap[int(rackID)] + 1
+		if node.Rack >= 0 {
+			if _, found := rackCap[node.Rack]; found {
+				rackCap[node.Rack] = rackCap[node.Rack] + 1
 			} else {
-				rackCap[int(rackID)] = 1
+				rackCap[node.Rack] = 1
 			}
-			if gpu, found := node.Node.ObjectMeta.Labels["GPU"]; found && gpu == "true" {
-				if int(rackID) > input.NumLargeMachineRacks {
-					input.NumLargeMachineRacks = int(rackID)
+			if node.GPU {
+				if node.Rack > input.NumLargeMachineRacks {
+					input.NumLargeMachineRacks = node.Rack
 				}
 			}
 		}
@@ -138,20 +157,17 @@ func prepareInput(jobs []*api.JobInfo, nodes []*api.NodeInfo, nodesAvailable map
 	// Collect job info
 	for _, job := range jobs {
 		var queueJob JobT
-		queueJob.JobID = jobNum(job)
+		queueJob.JobID = job.ID
 		queueJob.K = job.MinAvailable
-		for _, task := range job.TaskStatusIndex[api.Pending] {
-			queueJob.JobType = task.Pod.ObjectMeta.Labels["type"]
-			queueJob.Duration = atoi(task.Pod.ObjectMeta.Labels["FastDuration"])
-			queueJob.SlowDuration = atoi(task.Pod.ObjectMeta.Labels["SlowDuration"])
-			break
-		}
+		queueJob.JobType = job.Type
+		queueJob.Duration = job.FastDuration
+		queueJob.SlowDuration = job.SlowDuration
 		input.Queue = append(input.Queue, queueJob)
 	}
 
 	// Collect node info
-	for nodeName, _ := range nodesAvailable {
-		input.Machines = append(input.Machines, nodeNum(nodeName))
+	for _, node := range nodesAvailable {
+		input.Machines = append(input.Machines, node.ID)
 	}
 
 	sort.Ints(input.Machines)
@@ -191,14 +207,16 @@ func (alloc *allocateAction) Execute(ssn *framework.Session) {
 	for _, job := range ssn.Jobs {
 		numPendingTasks := len(job.TaskStatusIndex[api.Pending])
 		if numPendingTasks >= job.MinAvailable {
+			job = addJobProperty(job)
 			jobQueue.Push(job)
+			if trace == "" {
+				trace = job.Trace
+			} else if trace != job.Trace {
+				glog.Errorf("Found multiple traces (%v, %v) in Session %v",
+					trace, job.Trace, ssn.UID)
+			}
 			if t == nil {
-				for _, task := range job.TaskStatusIndex[api.Pending] {
-					// TODO assume that all the jobs belong to the same trace
-					trace = task.Pod.ObjectMeta.Labels["trace"]
-					t = task
-					break
-				}
+				t = getOneTask(job)
 			}
 		} else {
 			glog.V(3).Infof("Job <%v, %v> has %v tasks pending but requires %v tasks (creation in progress?).",
@@ -231,6 +249,10 @@ func (alloc *allocateAction) Execute(ssn *framework.Session) {
 	selector := labels.SelectorFromSet(labels.Set(map[string]string{"type": "virtual-kubelet"}))
 	for _, node := range ssn.Nodes {
 		if selector.Matches(labels.Set(node.Node.Labels)) {
+			node = addNodeProperty(node)
+			if node.Rack < 0 {
+				continue
+			}
 			nodes = append(nodes, node)
 			if t.Resreq.LessEqual(node.Idle) {
 				nodesAvailable[node.Node.ObjectMeta.Name] = node
@@ -326,13 +348,12 @@ func (alloc *allocateAction) Execute(ssn *framework.Session) {
 
 		// prepare output for grader
 		var output OutputT
-		output.JobID = jobNum(jobAllocated)
+		output.JobID = jobAllocated.ID
 		// find nodes in the returned allocation that belong to <jobAllocated>
 		for _, task := range jobAllocated.TaskStatusIndex[api.Pending] {
 			node, found := allocation[task]
 			if found {
-				nodeID := nodeNum(node.Node.ObjectMeta.Name)
-				output.Machines = append(output.Machines, nodeID)
+				output.Machines = append(output.Machines, node.ID)
 			}
 		}
 
