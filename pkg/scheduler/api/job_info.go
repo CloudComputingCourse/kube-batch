@@ -21,7 +21,6 @@ import (
 
 	"k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1beta1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/kubernetes-incubator/kube-arbitrator/pkg/apis/utils"
@@ -120,14 +119,6 @@ type JobInfo struct {
 
 	// TODO(k82cn): keep backward compatbility, removed it when v1alpha1 finalized.
 	PDB *policyv1.PodDisruptionBudget
-
-	// Custom properties
-	ID int
-	Trace string
-	Type string
-	FastDuration int
-	SlowDuration int
-	CreationTime metav1.Time
 }
 
 func NewJobInfo(uid JobID) *JobInfo {

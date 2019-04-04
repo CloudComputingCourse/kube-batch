@@ -39,11 +39,6 @@ type NodeInfo struct {
 	Capability  *Resource
 
 	Tasks map[TaskID]*TaskInfo
-
-	// Custom properties
-	ID int
-	Rack int
-	GPU bool
 }
 
 func NewNodeInfo(node *v1.Node) *NodeInfo {
