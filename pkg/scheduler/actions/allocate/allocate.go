@@ -118,19 +118,6 @@ func getOneTask(job *api.JobInfo) *api.TaskInfo {
 	return nil
 }
 
-func jobOrderFn(l, r interface{}) int {
-	lv := l.(*api.JobInfo)
-	rv := r.(*api.JobInfo)
-	lc := lv.CreationTime
-	rc := rv.CreationTime
-	if lc.Before(&rc) {
-		glog.V(3).Infof("%s (%v) before %s (%v)", lv.Name, lc, rv.Name, rc)
-		return -1
-	}
-	glog.V(3).Infof("%s (%v) before %s (%v)", rv.Name, rc, lv.Name, lc)
-	return 1
-}
-
 func prepareInput(jobs []*api.JobInfo, nodes []*api.NodeInfo, nodesAvailable map[string]*api.NodeInfo) InputT {
 	var input InputT
 
@@ -200,7 +187,7 @@ func (alloc *allocateAction) Execute(ssn *framework.Session) {
 	}
 
 	// Prepare job queue
-	jobQueue := util.NewPriorityQueue(jobOrderFn)
+	jobQueue := util.NewPriorityQueue(ssn.JobOrderFn)
 	var trace string
 	var t *api.TaskInfo
 	for _, job := range ssn.Jobs {

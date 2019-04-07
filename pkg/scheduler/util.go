@@ -30,15 +30,6 @@ import (
 
 var defaultSchedulerConf = `
 actions: "allocate"
-tiers:
-- plugins:
-  - name: priority
-  - name: gang
-- plugins:
-  - name: drf
-  - name: predicates
-  - name: proportion
-  - name: nodeorder
 `
 
 func loadSchedulerConf(confStr string) ([]framework.Action, []conf.Tier, error) {
