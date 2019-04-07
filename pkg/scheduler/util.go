@@ -29,7 +29,7 @@ import (
 )
 
 var defaultSchedulerConf = `
-actions: "allocate, backfill"
+actions: "allocate"
 tiers:
 - plugins:
   - name: priority

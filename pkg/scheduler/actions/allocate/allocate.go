@@ -200,8 +200,7 @@ func (alloc *allocateAction) Execute(ssn *framework.Session) {
 	}
 
 	// Prepare job queue
-	ssn.AddJobOrderFn(alloc.Name(), jobOrderFn)
-	jobQueue := util.NewPriorityQueue(ssn.JobOrderFn)
+	jobQueue := util.NewPriorityQueue(jobOrderFn)
 	var trace string
 	var t *api.TaskInfo
 	for _, job := range ssn.Jobs {
