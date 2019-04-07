@@ -54,6 +54,8 @@ type Cache interface {
 
 	// BindVolumes binds volumes to the task
 	BindVolumes(task *api.TaskInfo) error
+	LoadSchedulerConf(path string) (map[string]string, error)
+	UpdateScheduledTime(task *api.TaskInfo) error
 }
 
 type VolumeBinder interface {

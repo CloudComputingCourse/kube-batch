@@ -17,8 +17,8 @@ limitations under the License.
 package allocate
 
 import (
-	"k8s.io/apimachinery/pkg/labels"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 
 	"github.com/golang/glog"
 
@@ -26,12 +26,12 @@ import (
 	"github.com/kubernetes-sigs/kube-batch/pkg/scheduler/framework"
 	"github.com/kubernetes-sigs/kube-batch/pkg/scheduler/util"
 
-	"strconv"
-	"os"
-	"fmt"
 	"encoding/json"
+	"fmt"
+	"os"
 	"reflect"
 	"sort"
+	"strconv"
 )
 
 type JobT struct {
@@ -200,7 +200,7 @@ func (alloc *allocateAction) Execute(ssn *framework.Session) {
 	}
 
 	// Prepare job queue
-	ssn.AddJobOrderFn(jobOrderFn)
+	ssn.AddJobOrderFn(alloc.Name(), jobOrderFn)
 	jobQueue := util.NewPriorityQueue(ssn.JobOrderFn)
 	var trace string
 	var t *api.TaskInfo
