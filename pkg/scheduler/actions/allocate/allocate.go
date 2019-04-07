@@ -22,9 +22,9 @@ import (
 
 	"github.com/golang/glog"
 
-	"github.com/kubernetes-incubator/kube-arbitrator/pkg/scheduler/api"
-	"github.com/kubernetes-incubator/kube-arbitrator/pkg/scheduler/framework"
-	"github.com/kubernetes-incubator/kube-arbitrator/pkg/scheduler/util"
+	"github.com/kubernetes-sigs/kube-batch/pkg/scheduler/api"
+	"github.com/kubernetes-sigs/kube-batch/pkg/scheduler/framework"
+	"github.com/kubernetes-sigs/kube-batch/pkg/scheduler/util"
 
 	"strconv"
 	"os"
@@ -158,7 +158,7 @@ func prepareInput(jobs []*api.JobInfo, nodes []*api.NodeInfo, nodesAvailable map
 	for _, job := range jobs {
 		var queueJob JobT
 		queueJob.JobID = job.ID
-		queueJob.K = job.MinAvailable
+		queueJob.K = int(job.MinAvailable)
 		queueJob.JobType = job.Type
 		queueJob.Duration = job.FastDuration
 		queueJob.SlowDuration = job.SlowDuration
@@ -206,7 +206,7 @@ func (alloc *allocateAction) Execute(ssn *framework.Session) {
 	var t *api.TaskInfo
 	for _, job := range ssn.Jobs {
 		numPendingTasks := len(job.TaskStatusIndex[api.Pending])
-		if numPendingTasks >= job.MinAvailable {
+		if numPendingTasks >= int(job.MinAvailable) {
 			job = addJobProperty(job)
 			jobQueue.Push(job)
 			if trace == "" {

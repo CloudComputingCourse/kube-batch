@@ -21,11 +21,16 @@ import (
 
 	"github.com/golang/glog"
 
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/uuid"
 
-	"github.com/kubernetes-incubator/kube-arbitrator/pkg/scheduler/api"
-	"github.com/kubernetes-incubator/kube-arbitrator/pkg/scheduler/cache"
+	"github.com/kubernetes-sigs/kube-batch/pkg/apis/scheduling/v1alpha1"
+	"github.com/kubernetes-sigs/kube-batch/pkg/scheduler/api"
+	"github.com/kubernetes-sigs/kube-batch/pkg/scheduler/cache"
+	"github.com/kubernetes-sigs/kube-batch/pkg/scheduler/conf"
+	"github.com/kubernetes-sigs/kube-batch/pkg/scheduler/metrics"
 )
 
 type Session struct {
@@ -33,84 +38,183 @@ type Session struct {
 
 	cache cache.Cache
 
-	Jobs      []*api.JobInfo
-	JobIndex  map[api.JobID]*api.JobInfo
-	Nodes     []*api.NodeInfo
-	NodeIndex map[string]*api.NodeInfo
-	Backlog   []*api.JobInfo
+	Jobs    map[api.JobID]*api.JobInfo
+	Nodes   map[string]*api.NodeInfo
+	Queues  map[api.QueueID]*api.QueueInfo
+	Backlog []*api.JobInfo
+	Tiers   []conf.Tier
 
-	plugins        []Plugin
+	plugins        map[string]Plugin
 	eventHandlers  []*EventHandler
-	jobOrderFns    []api.CompareFn
-	taskOrderFns   []api.CompareFn
-	predicateFns   []api.PredicateFn
-	preemptableFns []api.LessFn
-	jobReadyFns    []api.ValidateFn
+	jobOrderFns    map[string]api.CompareFn
+	queueOrderFns  map[string]api.CompareFn
+	taskOrderFns   map[string]api.CompareFn
+	predicateFns   map[string]api.PredicateFn
+	nodeOrderFns   map[string]api.NodeOrderFn
+	preemptableFns map[string]api.EvictableFn
+	reclaimableFns map[string]api.EvictableFn
+	overusedFns    map[string]api.ValidateFn
+	jobReadyFns    map[string]api.ValidateFn
+	jobValidFns    map[string]api.ValidateExFn
 }
 
 func openSession(cache cache.Cache) *Session {
 	ssn := &Session{
-		UID:       uuid.NewUUID(),
-		cache:     cache,
-		JobIndex:  map[api.JobID]*api.JobInfo{},
-		NodeIndex: map[string]*api.NodeInfo{},
-	}
+		UID:   uuid.NewUUID(),
+		cache: cache,
 
-	glog.V(3).Infof("Open Session %v", ssn.UID)
+		Jobs:   map[api.JobID]*api.JobInfo{},
+		Nodes:  map[string]*api.NodeInfo{},
+		Queues: map[api.QueueID]*api.QueueInfo{},
+
+		plugins:        map[string]Plugin{},
+		jobOrderFns:    map[string]api.CompareFn{},
+		queueOrderFns:  map[string]api.CompareFn{},
+		taskOrderFns:   map[string]api.CompareFn{},
+		predicateFns:   map[string]api.PredicateFn{},
+		nodeOrderFns:   map[string]api.NodeOrderFn{},
+		preemptableFns: map[string]api.EvictableFn{},
+		reclaimableFns: map[string]api.EvictableFn{},
+		overusedFns:    map[string]api.ValidateFn{},
+		jobReadyFns:    map[string]api.ValidateFn{},
+		jobValidFns:    map[string]api.ValidateExFn{},
+	}
 
 	snapshot := cache.Snapshot()
 
 	ssn.Jobs = snapshot.Jobs
 	for _, job := range ssn.Jobs {
-		ssn.JobIndex[job.UID] = job
+		if vjr := ssn.JobValid(job); vjr != nil {
+			if !vjr.Pass {
+				jc := &v1alpha1.PodGroupCondition{
+					Type:               v1alpha1.PodGroupUnschedulableType,
+					Status:             v1.ConditionTrue,
+					LastTransitionTime: metav1.Now(),
+					TransitionID:       string(ssn.UID),
+					Reason:             vjr.Reason,
+					Message:            vjr.Message,
+				}
+
+				if err := ssn.UpdateJobCondition(job, jc); err != nil {
+					glog.Errorf("Failed to update job condition: %v", err)
+				}
+			}
+
+			delete(ssn.Jobs, job.UID)
+		}
 	}
 
 	ssn.Nodes = snapshot.Nodes
-	for _, node := range ssn.Nodes {
-		ssn.NodeIndex[node.Name] = node
-	}
+	ssn.Queues = snapshot.Queues
+
+	glog.V(3).Infof("Open Session %v with <%d> Job and <%d> Queues",
+		ssn.UID, len(ssn.Jobs), len(ssn.Queues))
 
 	return ssn
 }
 
 func closeSession(ssn *Session) {
+	for _, job := range ssn.Jobs {
+		// If job is using PDB, ignore it.
+		// TODO(k82cn): remove it when removing PDB support
+		if job.PodGroup == nil {
+			ssn.cache.RecordJobStatusEvent(job)
+			continue
+		}
+
+		job.PodGroup.Status = jobStatus(ssn, job)
+		if _, err := ssn.cache.UpdateJobStatus(job); err != nil {
+			glog.Errorf("Failed to update job <%s/%s>: %v",
+				job.Namespace, job.Name, err)
+		}
+	}
+
 	ssn.Jobs = nil
-	ssn.JobIndex = nil
 	ssn.Nodes = nil
-	ssn.NodeIndex = nil
 	ssn.Backlog = nil
 	ssn.plugins = nil
 	ssn.eventHandlers = nil
 	ssn.jobOrderFns = nil
+	ssn.queueOrderFns = nil
 
 	glog.V(3).Infof("Close Session %v", ssn.UID)
 }
 
+func jobStatus(ssn *Session, jobInfo *api.JobInfo) v1alpha1.PodGroupStatus {
+	status := jobInfo.PodGroup.Status
+
+	unschedulable := false
+	for _, c := range status.Conditions {
+		if c.Type == v1alpha1.PodGroupUnschedulableType &&
+			c.Status == v1.ConditionTrue &&
+			c.TransitionID == string(ssn.UID) {
+
+			unschedulable = true
+			break
+		}
+	}
+
+	// If running tasks && unschedulable, unknown phase
+	if len(jobInfo.TaskStatusIndex[api.Running]) != 0 && unschedulable {
+		status.Phase = v1alpha1.PodGroupUnknown
+	} else {
+		allocated := 0
+		for status, tasks := range jobInfo.TaskStatusIndex {
+			if api.AllocatedStatus(status) {
+				allocated += len(tasks)
+			}
+		}
+
+		// If there're enough allocated resource, it's running
+		if int32(allocated) > jobInfo.PodGroup.Spec.MinMember {
+			status.Phase = v1alpha1.PodGroupRunning
+		} else {
+			status.Phase = v1alpha1.PodGroupPending
+		}
+	}
+
+	status.Running = int32(len(jobInfo.TaskStatusIndex[api.Running]))
+	status.Failed = int32(len(jobInfo.TaskStatusIndex[api.Failed]))
+	status.Succeeded = int32(len(jobInfo.TaskStatusIndex[api.Succeeded]))
+
+	return status
+}
+
+func (ssn *Session) Statement() *Statement {
+	return &Statement{
+		ssn: ssn,
+	}
+}
+
 func (ssn *Session) Pipeline(task *api.TaskInfo, hostname string) error {
 	// Only update status in session
-	job, found := ssn.JobIndex[task.Job]
+	job, found := ssn.Jobs[task.Job]
 	if found {
 		if err := job.UpdateTaskStatus(task, api.Pipelined); err != nil {
 			glog.Errorf("Failed to update task <%v/%v> status to %v in Session <%v>: %v",
 				task.Namespace, task.Name, api.Pipelined, ssn.UID, err)
+			return err
 		}
 	} else {
 		glog.Errorf("Failed to found Job <%s> in Session <%s> index when binding.",
 			task.Job, ssn.UID)
+		return fmt.Errorf("failed to find job %s when binding", task.Job)
 	}
 
 	task.NodeName = hostname
 
-	if node, found := ssn.NodeIndex[hostname]; found {
-		if err := node.PipelineTask(task); err != nil {
-			glog.Errorf("Failed to pipeline task <%v/%v> to node <%v> in Session <%v>: %v",
+	if node, found := ssn.Nodes[hostname]; found {
+		if err := node.AddTask(task); err != nil {
+			glog.Errorf("Failed to add task <%v/%v> to node <%v> in Session <%v>: %v",
 				task.Namespace, task.Name, hostname, ssn.UID, err)
+			return err
 		}
-		glog.V(3).Infof("After pipelined Task <%v/%v> to Node <%v>: idle <%v>, used <%v>, releasing <%v>",
+		glog.V(3).Infof("After added Task <%v/%v> to Node <%v>: idle <%v>, used <%v>, releasing <%v>",
 			task.Namespace, task.Name, node.Name, node.Idle, node.Used, node.Releasing)
 	} else {
 		glog.Errorf("Failed to found Node <%s> in Session <%s> index when binding.",
 			hostname, ssn.UID)
+		return fmt.Errorf("failed to find node %s", hostname)
 	}
 
 	for _, eh := range ssn.eventHandlers {
@@ -125,30 +229,38 @@ func (ssn *Session) Pipeline(task *api.TaskInfo, hostname string) error {
 }
 
 func (ssn *Session) Allocate(task *api.TaskInfo, hostname string) error {
+	if err := ssn.cache.AllocateVolumes(task, hostname); err != nil {
+		return err
+	}
+
 	// Only update status in session
-	job, found := ssn.JobIndex[task.Job]
+	job, found := ssn.Jobs[task.Job]
 	if found {
 		if err := job.UpdateTaskStatus(task, api.Allocated); err != nil {
 			glog.Errorf("Failed to update task <%v/%v> status to %v in Session <%v>: %v",
 				task.Namespace, task.Name, api.Allocated, ssn.UID, err)
+			return err
 		}
 	} else {
 		glog.Errorf("Failed to found Job <%s> in Session <%s> index when binding.",
 			task.Job, ssn.UID)
+		return fmt.Errorf("failed to find job %s", task.Job)
 	}
 
 	task.NodeName = hostname
 
-	if node, found := ssn.NodeIndex[hostname]; found {
+	if node, found := ssn.Nodes[hostname]; found {
 		if err := node.AddTask(task); err != nil {
 			glog.Errorf("Failed to add task <%v/%v> to node <%v> in Session <%v>: %v",
 				task.Namespace, task.Name, hostname, ssn.UID, err)
+			return err
 		}
 		glog.V(3).Infof("After allocated Task <%v/%v> to Node <%v>: idle <%v>, used <%v>, releasing <%v>",
 			task.Namespace, task.Name, node.Name, node.Idle, node.Used, node.Releasing)
 	} else {
 		glog.Errorf("Failed to found Node <%s> in Session <%s> index when binding.",
 			hostname, ssn.UID)
+		return fmt.Errorf("failed to find node %s", hostname)
 	}
 
 	// Callbacks
@@ -162,7 +274,11 @@ func (ssn *Session) Allocate(task *api.TaskInfo, hostname string) error {
 
 	if ssn.JobReady(job) {
 		for _, task := range job.TaskStatusIndex[api.Allocated] {
-			ssn.dispatch(task)
+			if err := ssn.dispatch(task); err != nil {
+				glog.Errorf("Failed to dispatch task <%v/%v>: %v",
+					task.Namespace, task.Name, err)
+				return err
+			}
 		}
 	}
 
@@ -170,72 +286,90 @@ func (ssn *Session) Allocate(task *api.TaskInfo, hostname string) error {
 }
 
 func (ssn *Session) dispatch(task *api.TaskInfo) error {
+	if err := ssn.cache.BindVolumes(task); err != nil {
+		return err
+	}
+
 	if err := ssn.cache.Bind(task, task.NodeName); err != nil {
 		return err
 	}
 
 	// Update status in session
-	if job, found := ssn.JobIndex[task.Job]; found {
+	if job, found := ssn.Jobs[task.Job]; found {
 		if err := job.UpdateTaskStatus(task, api.Binding); err != nil {
 			glog.Errorf("Failed to update task <%v/%v> status to %v in Session <%v>: %v",
 				task.Namespace, task.Name, api.Binding, ssn.UID, err)
+			return err
 		}
 	} else {
 		glog.Errorf("Failed to found Job <%s> in Session <%s> index when binding.",
 			task.Job, ssn.UID)
+		return fmt.Errorf("failed to find job %s", task.Job)
+	}
+
+	metrics.UpdateTaskScheduleDuration(metrics.Duration(task.Pod.CreationTimestamp.Time))
+	return nil
+}
+
+func (ssn *Session) Evict(reclaimee *api.TaskInfo, reason string) error {
+	if err := ssn.cache.Evict(reclaimee, reason); err != nil {
+		return err
+	}
+
+	// Update status in session
+	job, found := ssn.Jobs[reclaimee.Job]
+	if found {
+		if err := job.UpdateTaskStatus(reclaimee, api.Releasing); err != nil {
+			glog.Errorf("Failed to update task <%v/%v> status to %v in Session <%v>: %v",
+				reclaimee.Namespace, reclaimee.Name, api.Releasing, ssn.UID, err)
+			return err
+		}
+	} else {
+		glog.Errorf("Failed to found Job <%s> in Session <%s> index when binding.",
+			reclaimee.Job, ssn.UID)
+		return fmt.Errorf("failed to find job %s", reclaimee.Job)
+	}
+
+	// Update task in node.
+	if node, found := ssn.Nodes[reclaimee.NodeName]; found {
+		if err := node.UpdateTask(reclaimee); err != nil {
+			glog.Errorf("Failed to update task <%v/%v> in Session <%v>: %v",
+				reclaimee.Namespace, reclaimee.Name, ssn.UID, err)
+			return err
+		}
+	}
+
+	for _, eh := range ssn.eventHandlers {
+		if eh.DeallocateFunc != nil {
+			eh.DeallocateFunc(&Event{
+				Task: reclaimee,
+			})
+		}
 	}
 
 	return nil
 }
 
-func (ssn *Session) Preemptable(preemptor, preemptee *api.TaskInfo) bool {
-	if len(ssn.preemptableFns) == 0 {
-		return false
+// UpdateJobStatus update job condition accordingly.
+func (ssn *Session) UpdateJobCondition(jobInfo *api.JobInfo, cond *v1alpha1.PodGroupCondition) error {
+	job, ok := ssn.Jobs[jobInfo.UID]
+	if !ok {
+		return fmt.Errorf("failed to find job <%s/%s>", jobInfo.Namespace, jobInfo.Name)
 	}
 
-	for _, preemptable := range ssn.preemptableFns {
-		if !preemptable(preemptor, preemptee) {
-			return false
+	index := -1
+	for i, c := range job.PodGroup.Status.Conditions {
+		if c.Type == cond.Type {
+			index = i
+			break
 		}
 	}
 
-	return true
-}
-
-func (ssn *Session) Preempt(preemptor, preemptee *api.TaskInfo) error {
-	if err := ssn.cache.Evict(preemptee); err != nil {
-		return err
-	}
-
-	// Update status in session
-	job, found := ssn.JobIndex[preemptee.Job]
-	if found {
-		if err := job.UpdateTaskStatus(preemptee, api.Releasing); err != nil {
-			glog.Errorf("Failed to update task <%v/%v> status to %v in Session <%v>: %v",
-				preemptee.Namespace, preemptee.Name, api.Releasing, ssn.UID, err)
-		}
+	// Update condition to the new condition.
+	if index < 0 {
+		job.PodGroup.Status.Conditions = append(job.PodGroup.Status.Conditions, *cond)
 	} else {
-		glog.Errorf("Failed to found Job <%s> in Session <%s> index when binding.",
-			preemptee.Job, ssn.UID)
-	}
-
-	// Update task in node.
-	if node, found := ssn.NodeIndex[preemptee.NodeName]; found {
-		node.UpdateTask(preemptee)
-	}
-
-	for _, eh := range ssn.eventHandlers {
-		if eh.AllocateFunc != nil {
-			eh.AllocateFunc(&Event{
-				Task: preemptor,
-			})
-		}
-
-		if eh.EvictFunc != nil {
-			eh.EvictFunc(&Event{
-				Task: preemptee,
-			})
-		}
+		job.PodGroup.Status.Conditions[index] = *cond
 	}
 
 	return nil
@@ -243,83 +377,6 @@ func (ssn *Session) Preempt(preemptor, preemptee *api.TaskInfo) error {
 
 func (ssn *Session) AddEventHandler(eh *EventHandler) {
 	ssn.eventHandlers = append(ssn.eventHandlers, eh)
-}
-
-func (ssn *Session) AddJobOrderFn(cf api.CompareFn) {
-	ssn.jobOrderFns = append(ssn.jobOrderFns, cf)
-}
-
-func (ssn *Session) AddTaskOrderFn(cf api.CompareFn) {
-	ssn.taskOrderFns = append(ssn.taskOrderFns, cf)
-}
-
-func (ssn *Session) AddPreemptableFn(cf api.LessFn) {
-	ssn.preemptableFns = append(ssn.preemptableFns, cf)
-}
-
-func (ssn *Session) AddJobReadyFn(vf api.ValidateFn) {
-	ssn.jobReadyFns = append(ssn.jobReadyFns, vf)
-}
-
-func (ssn *Session) AddPredicateFn(pf api.PredicateFn) {
-	ssn.predicateFns = append(ssn.predicateFns, pf)
-}
-
-func (ssn *Session) JobReady(obj interface{}) bool {
-	for _, jrf := range ssn.jobReadyFns {
-		if !jrf(obj) {
-			return false
-		}
-	}
-
-	return true
-}
-
-func (ssn *Session) JobOrderFn(l, r interface{}) bool {
-	for _, jof := range ssn.jobOrderFns {
-		if j := jof(l, r); j != 0 {
-			return j < 0
-		}
-	}
-
-	// If no job order funcs, order job by UID.
-	lv := l.(*api.JobInfo)
-	rv := r.(*api.JobInfo)
-
-	return lv.UID < rv.UID
-}
-
-func (ssn *Session) TaskCompareFns(l, r interface{}) int {
-	for _, tof := range ssn.taskOrderFns {
-		if j := tof(l, r); j != 0 {
-			return j
-		}
-	}
-
-	return 0
-}
-
-func (ssn *Session) TaskOrderFn(l, r interface{}) bool {
-	if res := ssn.TaskCompareFns(l, r); res != 0 {
-		return res < 0
-	}
-
-	// If no task order funcs, order task by UID.
-	lv := l.(*api.TaskInfo)
-	rv := r.(*api.TaskInfo)
-
-	return lv.UID < rv.UID
-}
-
-func (ssn *Session) PredicateFn(task *api.TaskInfo, node *api.NodeInfo) error {
-	for _, pfn := range ssn.predicateFns {
-		err := pfn(task, node)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
 }
 
 func (ssn Session) String() string {

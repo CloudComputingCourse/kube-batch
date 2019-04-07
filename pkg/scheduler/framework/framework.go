@@ -17,23 +17,34 @@ limitations under the License.
 package framework
 
 import (
+	"time"
+
 	"github.com/golang/glog"
-	"github.com/kubernetes-incubator/kube-arbitrator/pkg/scheduler/cache"
+
+	"github.com/kubernetes-sigs/kube-batch/pkg/scheduler/cache"
+	"github.com/kubernetes-sigs/kube-batch/pkg/scheduler/conf"
+	"github.com/kubernetes-sigs/kube-batch/pkg/scheduler/metrics"
 )
 
-func OpenSession(cache cache.Cache, args []*PluginArgs) *Session {
+func OpenSession(cache cache.Cache, tiers []conf.Tier) *Session {
 	ssn := openSession(cache)
+	ssn.Tiers = tiers
 
-	for _, arg := range args {
-		if pb, found := GetPluginBuilder(arg.Name); !found {
-			glog.Errorf("Failed to get plugin %s.", arg.Name)
-		} else {
-			ssn.plugins = append(ssn.plugins, pb(arg))
+	for _, tier := range tiers {
+		for _, plugin := range tier.Plugins {
+			if pb, found := GetPluginBuilder(plugin.Name); !found {
+				glog.Errorf("Failed to get plugin %s.", plugin.Name)
+			} else {
+				plugin := pb(plugin.Arguments)
+				ssn.plugins[plugin.Name()] = plugin
+			}
 		}
 	}
 
 	for _, plugin := range ssn.plugins {
+		onSessionOpenStart := time.Now()
 		plugin.OnSessionOpen(ssn)
+		metrics.UpdatePluginDuration(plugin.Name(), metrics.OnSessionOpen, metrics.Duration(onSessionOpenStart))
 	}
 
 	return ssn
@@ -41,7 +52,9 @@ func OpenSession(cache cache.Cache, args []*PluginArgs) *Session {
 
 func CloseSession(ssn *Session) {
 	for _, plugin := range ssn.plugins {
+		onSessionCloseStart := time.Now()
 		plugin.OnSessionClose(ssn)
+		metrics.UpdatePluginDuration(plugin.Name(), metrics.OnSessionClose, metrics.Duration(onSessionCloseStart))
 	}
 
 	closeSession(ssn)

@@ -103,25 +103,6 @@ func (ni *NodeInfo) SetNode(node *v1.Node) {
 	}
 }
 
-func (ni *NodeInfo) PipelineTask(task *TaskInfo) error {
-	key := PodKey(task.Pod)
-	if _, found := ni.Tasks[key]; found {
-		return fmt.Errorf("task <%v/%v> already on node <%v>",
-			task.Namespace, task.Name, ni.Name)
-	}
-
-	ti := task.Clone()
-
-	if ni.Node != nil {
-		ni.Releasing.Sub(ti.Resreq)
-		ni.Used.Add(ti.Resreq)
-	}
-
-	ni.Tasks[key] = ti
-
-	return nil
-}
-
 func (ni *NodeInfo) AddTask(task *TaskInfo) error {
 	key := PodKey(task.Pod)
 	if _, found := ni.Tasks[key]; found {
@@ -134,10 +115,16 @@ func (ni *NodeInfo) AddTask(task *TaskInfo) error {
 	ti := task.Clone()
 
 	if ni.Node != nil {
-		if ti.Status == Releasing {
+		switch ti.Status {
+		case Releasing:
 			ni.Releasing.Add(ti.Resreq)
+			ni.Idle.Sub(ti.Resreq)
+		case Pipelined:
+			ni.Releasing.Sub(ti.Resreq)
+		default:
+			ni.Idle.Sub(ti.Resreq)
 		}
-		ni.Idle.Sub(ti.Resreq)
+
 		ni.Used.Add(ti.Resreq)
 	}
 
@@ -156,11 +143,16 @@ func (ni *NodeInfo) RemoveTask(ti *TaskInfo) error {
 	}
 
 	if ni.Node != nil {
-		if task.Status == Releasing {
+		switch task.Status {
+		case Releasing:
 			ni.Releasing.Sub(task.Resreq)
+			ni.Idle.Add(task.Resreq)
+		case Pipelined:
+			ni.Releasing.Add(task.Resreq)
+		default:
+			ni.Idle.Add(task.Resreq)
 		}
 
-		ni.Idle.Add(task.Resreq)
 		ni.Used.Sub(task.Resreq)
 	}
 
@@ -186,8 +178,8 @@ func (ni NodeInfo) String() string {
 		i++
 	}
 
-	return fmt.Sprintf("Node (%s): idle <%v>, used <%v>, releasing <%v>%s",
-		ni.Name, ni.Idle, ni.Used, ni.Releasing, res)
+	return fmt.Sprintf("Node (%s): idle <%v>, used <%v>, releasing <%v>, taints <%v>%s",
+		ni.Name, ni.Idle, ni.Used, ni.Releasing, ni.Node.Spec.Taints, res)
 
 }
 

@@ -2,16 +2,19 @@ language: go
 
 sudo: required
 
+env:
+  - HOME=/home/travis
+
 services:
   - docker
 
 go:
-  - "1.10"
+  - "1.11"
 
-go_import_path: github.com/kubernetes-incubator/kube-arbitrator
+go_import_path: github.com/kubernetes-sigs/kube-batch
 
 install:
-  - go get -u github.com/golang/lint/golint
+  - go get -u golang.org/x/lint/golint
 
 before_script:
   - export TEST_LOG_LEVEL=4
@@ -22,6 +25,3 @@ script:
   - make run-test
   - make e2e
 
-notifications:
-  webhooks: https://www.travisbuddy.com/
-  on_success: never

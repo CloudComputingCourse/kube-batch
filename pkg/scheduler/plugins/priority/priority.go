@@ -18,18 +18,21 @@ package priority
 
 import (
 	"github.com/golang/glog"
-	"github.com/kubernetes-incubator/kube-arbitrator/pkg/scheduler/api"
-	"github.com/kubernetes-incubator/kube-arbitrator/pkg/scheduler/framework"
+	"github.com/kubernetes-sigs/kube-batch/pkg/scheduler/api"
+	"github.com/kubernetes-sigs/kube-batch/pkg/scheduler/framework"
 )
 
 type priorityPlugin struct {
-	args *framework.PluginArgs
+	// Arguments given for the plugin
+	pluginArguments framework.Arguments
 }
 
-func New(args *framework.PluginArgs) framework.Plugin {
-	return &priorityPlugin{
-		args: args,
-	}
+func New(arguments framework.Arguments) framework.Plugin {
+	return &priorityPlugin{pluginArguments: arguments}
+}
+
+func (pp *priorityPlugin) Name() string {
+	return "priority"
 }
 
 func (pp *priorityPlugin) OnSessionOpen(ssn *framework.Session) {
@@ -37,7 +40,7 @@ func (pp *priorityPlugin) OnSessionOpen(ssn *framework.Session) {
 		lv := l.(*api.TaskInfo)
 		rv := r.(*api.TaskInfo)
 
-		glog.V(3).Infof("Priority TaskOrder: <%v/%v> prority is %v, <%v/%v> priority is %v",
+		glog.V(4).Infof("Priority TaskOrder: <%v/%v> priority is %v, <%v/%v> priority is %v",
 			lv.Namespace, lv.Name, lv.Priority, rv.Namespace, rv.Name, rv.Priority)
 
 		if lv.Priority == rv.Priority {
@@ -52,15 +55,13 @@ func (pp *priorityPlugin) OnSessionOpen(ssn *framework.Session) {
 	}
 
 	// Add Task Order function
-	if pp.args.TaskOrderFnEnabled {
-		ssn.AddTaskOrderFn(taskOrderFn)
-	}
+	ssn.AddTaskOrderFn(pp.Name(), taskOrderFn)
 
 	jobOrderFn := func(l, r interface{}) int {
 		lv := l.(*api.JobInfo)
 		rv := r.(*api.JobInfo)
 
-		glog.V(3).Infof("Priority JobOrderFn: <%v/%v> is ready: %d, <%v/%v> is ready: %d",
+		glog.V(4).Infof("Priority JobOrderFn: <%v/%v> priority: %d, <%v/%v> priority: %d",
 			lv.Namespace, lv.Name, lv.Priority, rv.Namespace, rv.Name, rv.Priority)
 
 		if lv.Priority > rv.Priority {
@@ -74,10 +75,7 @@ func (pp *priorityPlugin) OnSessionOpen(ssn *framework.Session) {
 		return 0
 	}
 
-	if pp.args.JobOrderFnEnabled {
-		// Add Job Order function
-		ssn.AddJobOrderFn(jobOrderFn)
-	}
+	ssn.AddJobOrderFn(pp.Name(), jobOrderFn)
 }
 
 func (pp *priorityPlugin) OnSessionClose(ssn *framework.Session) {}

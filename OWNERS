@@ -1,8 +1,12 @@
-approver:
-  - timothysc
+approvers:
   - k82cn
-  - foxish
-reviewer:
-  - timothysc
+  - jinzhejz
+  - animeshsingh
+  - hex108
+reviewers:
   - k82cn
-  - foxish
+  - jinzhejz
+  - suleisl2000
+  - tizhou86
+  - animeshsingh
+  - hex108

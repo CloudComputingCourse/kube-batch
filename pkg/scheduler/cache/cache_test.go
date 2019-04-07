@@ -26,7 +26,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
-	"github.com/kubernetes-incubator/kube-arbitrator/pkg/scheduler/api"
+	"github.com/kubernetes-sigs/kube-batch/pkg/scheduler/api"
 )
 
 func nodesEqual(l, r map[string]*api.NodeInfo) bool {
@@ -133,13 +133,15 @@ func TestAddPod(t *testing.T) {
 	pod1 := buildPod("c1", "p1", "", v1.PodPending, buildResourceList("1000m", "1G"),
 		[]metav1.OwnerReference{owner}, make(map[string]string))
 	pi1 := api.NewTaskInfo(pod1)
+	pi1.Job = "j1" // The job name is set by cache.
 	pod2 := buildPod("c1", "p2", "n1", v1.PodRunning, buildResourceList("1000m", "1G"),
 		[]metav1.OwnerReference{owner}, make(map[string]string))
 	pi2 := api.NewTaskInfo(pod2)
+	pi2.Job = "j1" // The job name is set by cache.
 
-	j1 := api.NewJobInfo(api.JobID("j1"))
-	j1.AddTaskInfo(pi1)
-	j1.AddTaskInfo(pi2)
+	j1 := api.NewJobInfo(api.JobID("j1"), pi1, pi2)
+	pg := createShadowPodGroup(pod1)
+	j1.SetPodGroup(pg)
 
 	node1 := buildNode("n1", buildResourceList("2000m", "10G"))
 	ni1 := api.NewNodeInfo(node1)
@@ -186,17 +188,34 @@ func TestAddPod(t *testing.T) {
 }
 
 func TestAddNode(t *testing.T) {
+	owner1 := buildOwnerReference("j1")
+	owner2 := buildOwnerReference("j2")
 
 	// case 1
 	node1 := buildNode("n1", buildResourceList("2000m", "10G"))
 	pod1 := buildPod("c1", "p1", "", v1.PodPending, buildResourceList("1000m", "1G"),
-		[]metav1.OwnerReference{}, make(map[string]string))
+		[]metav1.OwnerReference{owner1}, make(map[string]string))
+	pi1 := api.NewTaskInfo(pod1)
+	pi1.Job = "j1" // The job name is set by cache.
+
 	pod2 := buildPod("c1", "p2", "n1", v1.PodRunning, buildResourceList("1000m", "1G"),
-		[]metav1.OwnerReference{}, make(map[string]string))
+		[]metav1.OwnerReference{owner2}, make(map[string]string))
 	pi2 := api.NewTaskInfo(pod2)
+	pi2.Job = "j2" // The job name is set by cache.
 
 	ni1 := api.NewNodeInfo(node1)
 	ni1.AddTask(pi2)
+
+	j1 := api.NewJobInfo("j1")
+	pg1 := createShadowPodGroup(pod1)
+	j1.SetPodGroup(pg1)
+
+	j2 := api.NewJobInfo("j2")
+	pg2 := createShadowPodGroup(pod2)
+	j2.SetPodGroup(pg2)
+
+	j1.AddTaskInfo(pi1)
+	j2.AddTaskInfo(pi2)
 
 	tests := []struct {
 		pods     []*v1.Pod
@@ -209,6 +228,10 @@ func TestAddNode(t *testing.T) {
 			expected: &SchedulerCache{
 				Nodes: map[string]*api.NodeInfo{
 					"n1": ni1,
+				},
+				Jobs: map[api.JobID]*api.JobInfo{
+					"j1": j1,
+					"j2": j2,
 				},
 			},
 		},
@@ -231,6 +254,56 @@ func TestAddNode(t *testing.T) {
 		if !cacheEqual(cache, test.expected) {
 			t.Errorf("case %d: \n expected %v, \n got %v \n",
 				i, test.expected, cache)
+		}
+	}
+}
+
+func TestGetOrCreateJob(t *testing.T) {
+	owner1 := buildOwnerReference("j1")
+	owner2 := buildOwnerReference("j2")
+
+	pod1 := buildPod("c1", "p1", "n1", v1.PodRunning, buildResourceList("1000m", "1G"),
+		[]metav1.OwnerReference{owner1}, make(map[string]string))
+	pi1 := api.NewTaskInfo(pod1)
+	pi1.Job = "j1" // The job name is set by cache.
+
+	pod2 := buildPod("c1", "p2", "n1", v1.PodRunning, buildResourceList("1000m", "1G"),
+		[]metav1.OwnerReference{owner2}, make(map[string]string))
+	pod2.Spec.SchedulerName = "kube-batch"
+	pi2 := api.NewTaskInfo(pod2)
+
+	pod3 := buildPod("c3", "p3", "n1", v1.PodRunning, buildResourceList("1000m", "1G"),
+		[]metav1.OwnerReference{owner2}, make(map[string]string))
+	pi3 := api.NewTaskInfo(pod3)
+
+	cache := &SchedulerCache{
+		Nodes:         make(map[string]*api.NodeInfo),
+		Jobs:          make(map[api.JobID]*api.JobInfo),
+		schedulerName: "kube-batch",
+	}
+
+	tests := []struct {
+		task   *api.TaskInfo
+		gotJob bool // whether getOrCreateJob will return job for corresponding task
+	}{
+		{
+			task:   pi1,
+			gotJob: true,
+		},
+		{
+			task:   pi2,
+			gotJob: true,
+		},
+		{
+			task:   pi3,
+			gotJob: false,
+		},
+	}
+	for i, test := range tests {
+		result := cache.getOrCreateJob(test.task) != nil
+		if result != test.gotJob {
+			t.Errorf("case %d: \n expected %t, \n got %t \n",
+				i, test.gotJob, result)
 		}
 	}
 }

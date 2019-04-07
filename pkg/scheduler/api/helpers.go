@@ -96,9 +96,9 @@ func MergeErrors(errs ...error) error {
 	return nil
 }
 
-// JobTerminated checkes whether job was terminated.
+// JobTerminated checks whether job was terminated.
 func JobTerminated(job *JobInfo) bool {
-	return job.SchedSpec == nil &&
+	return job.PodGroup == nil &&
 		job.PDB == nil &&
 		len(job.Tasks) == 0
 }

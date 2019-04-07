@@ -1,1 +1,1 @@
-This directory includes all design doc of kube-arbitrator.
+This directory includes all the design docs of kube-batch.
