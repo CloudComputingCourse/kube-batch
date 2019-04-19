@@ -1,15 +1,16 @@
 package cache
 
 import (
-	"time"
 	"fmt"
+	"time"
 
 	"github.com/golang/glog"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/cache"
 
-	arbapi "github.com/kubernetes-incubator/kube-arbitrator/pkg/scheduler/api"
+	arbapi "github.com/kubernetes-sigs/kube-batch/pkg/scheduler/api"
 )
 
 func (sc *SchedulerCache) UpdateScheduledTime(task *arbapi.TaskInfo) error {
@@ -48,3 +49,17 @@ func (sc *SchedulerCache) UpdateScheduledTime(task *arbapi.TaskInfo) error {
 	}
 	return fmt.Errorf("update pod schuduled time failed after %d retries", retryTimes)
 }
+
+func (sc *SchedulerCache) LoadSchedulerConf(path string) (map[string]string, error) {
+	       ns, name, err := cache.SplitMetaNamespaceKey(path)
+	       if err != nil {
+		               return nil, err
+		       }
+
+		       confMap, err := sc.kubeclient.CoreV1().ConfigMaps(ns).Get(name, metav1.GetOptions{})
+	       if err != nil {
+		               return nil, err
+		       }
+
+		       return confMap.Data, nil
+	}

@@ -24,31 +24,58 @@ import (
 
 	"k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1beta1"
+	"k8s.io/api/scheduling/v1beta1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/cache"
 
-	"github.com/kubernetes-incubator/kube-arbitrator/pkg/apis/utils"
-	arbv1 "github.com/kubernetes-incubator/kube-arbitrator/pkg/apis/v1alpha1"
-	arbapi "github.com/kubernetes-incubator/kube-arbitrator/pkg/scheduler/api"
+	kbv1 "github.com/kubernetes-sigs/kube-batch/pkg/apis/scheduling/v1alpha1"
+	"github.com/kubernetes-sigs/kube-batch/pkg/apis/utils"
+	kbapi "github.com/kubernetes-sigs/kube-batch/pkg/scheduler/api"
 )
 
-func isTerminated(status arbapi.TaskStatus) bool {
-	return status == arbapi.Succeeded || status == arbapi.Failed
+func isTerminated(status kbapi.TaskStatus) bool {
+	return status == kbapi.Succeeded || status == kbapi.Failed
 }
 
-func (sc *SchedulerCache) addTask(pi *arbapi.TaskInfo) error {
-	if len(pi.Job) != 0 {
-		if _, found := sc.Jobs[pi.Job]; !found {
-			sc.Jobs[pi.Job] = arbapi.NewJobInfo(pi.Job)
+// getOrCreateJob will return corresponding Job for pi if it exists, or it will create a Job and return it if
+// pi.Pod.Spec.SchedulerName is same as kube-batch scheduler's name, otherwise it will return nil.
+func (sc *SchedulerCache) getOrCreateJob(pi *kbapi.TaskInfo) *kbapi.JobInfo {
+	if len(pi.Job) == 0 {
+		if pi.Pod.Spec.SchedulerName != sc.schedulerName {
+			glog.V(4).Infof("Pod %s/%s will not not scheduled by %s, skip creating PodGroup and Job for it",
+				pi.Pod.Namespace, pi.Pod.Name, sc.schedulerName)
+			return nil
 		}
+		pb := createShadowPodGroup(pi.Pod)
+		pi.Job = kbapi.JobID(pb.Name)
 
-		sc.Jobs[pi.Job].AddTaskInfo(pi)
+		if _, found := sc.Jobs[pi.Job]; !found {
+			job := kbapi.NewJobInfo(pi.Job)
+			job.SetPodGroup(pb)
+			// Set default queue for shadow podgroup.
+			job.Queue = kbapi.QueueID(sc.defaultQueue)
+
+			sc.Jobs[pi.Job] = job
+		}
+	} else {
+		if _, found := sc.Jobs[pi.Job]; !found {
+			sc.Jobs[pi.Job] = kbapi.NewJobInfo(pi.Job)
+		}
+	}
+
+	return sc.Jobs[pi.Job]
+}
+
+func (sc *SchedulerCache) addTask(pi *kbapi.TaskInfo) error {
+	job := sc.getOrCreateJob(pi)
+	if job != nil {
+		job.AddTaskInfo(pi)
 	}
 
 	if len(pi.NodeName) != 0 {
 		if _, found := sc.Nodes[pi.NodeName]; !found {
-			sc.Nodes[pi.NodeName] = arbapi.NewNodeInfo(nil)
+			sc.Nodes[pi.NodeName] = kbapi.NewNodeInfo(nil)
 		}
 
 		node := sc.Nodes[pi.NodeName]
@@ -62,12 +89,12 @@ func (sc *SchedulerCache) addTask(pi *arbapi.TaskInfo) error {
 
 // Assumes that lock is already acquired.
 func (sc *SchedulerCache) addPod(pod *v1.Pod) error {
-	pi := arbapi.NewTaskInfo(pod)
+	pi := kbapi.NewTaskInfo(pod)
 
 	return sc.addTask(pi)
 }
 
-func (sc *SchedulerCache) syncTask(oldTask *arbapi.TaskInfo) error {
+func (sc *SchedulerCache) syncTask(oldTask *kbapi.TaskInfo) error {
 	sc.Mutex.Lock()
 	defer sc.Mutex.Unlock()
 
@@ -82,12 +109,12 @@ func (sc *SchedulerCache) syncTask(oldTask *arbapi.TaskInfo) error {
 		return fmt.Errorf("failed to get Pod <%v/%v>: err %v", oldTask.Namespace, oldTask.Name, err)
 	}
 
-	newTask := arbapi.NewTaskInfo(newPod)
+	newTask := kbapi.NewTaskInfo(newPod)
 
 	return sc.updateTask(oldTask, newTask)
 }
 
-func (sc *SchedulerCache) updateTask(oldTask, newTask *arbapi.TaskInfo) error {
+func (sc *SchedulerCache) updateTask(oldTask, newTask *kbapi.TaskInfo) error {
 	if err := sc.deleteTask(oldTask); err != nil {
 		return err
 	}
@@ -103,7 +130,7 @@ func (sc *SchedulerCache) updatePod(oldPod, newPod *v1.Pod) error {
 	return sc.addPod(newPod)
 }
 
-func (sc *SchedulerCache) deleteTask(pi *arbapi.TaskInfo) error {
+func (sc *SchedulerCache) deleteTask(pi *kbapi.TaskInfo) error {
 	var jobErr, nodeErr error
 
 	if len(pi.Job) != 0 {
@@ -123,7 +150,7 @@ func (sc *SchedulerCache) deleteTask(pi *arbapi.TaskInfo) error {
 	}
 
 	if jobErr != nil || nodeErr != nil {
-		return arbapi.MergeErrors(jobErr, nodeErr)
+		return kbapi.MergeErrors(jobErr, nodeErr)
 	}
 
 	return nil
@@ -131,7 +158,7 @@ func (sc *SchedulerCache) deleteTask(pi *arbapi.TaskInfo) error {
 
 // Assumes that lock is already acquired.
 func (sc *SchedulerCache) deletePod(pod *v1.Pod) error {
-	pi := arbapi.NewTaskInfo(pod)
+	pi := kbapi.NewTaskInfo(pod)
 
 	// Delete the Task in cache to handle Binding status.
 	task := pi
@@ -145,7 +172,7 @@ func (sc *SchedulerCache) deletePod(pod *v1.Pod) error {
 	}
 
 	// If job was terminated, delete it.
-	if job, found := sc.Jobs[pi.Job]; found && arbapi.JobTerminated(job) {
+	if job, found := sc.Jobs[pi.Job]; found && kbapi.JobTerminated(job) {
 		sc.deleteJob(job)
 	}
 
@@ -167,9 +194,8 @@ func (sc *SchedulerCache) AddPod(obj interface{}) {
 		glog.Errorf("Failed to add pod <%s/%s> into cache: %v",
 			pod.Namespace, pod.Name, err)
 		return
-	} else {
-		glog.V(3).Infof("Added pod <%s/%v> into cache.", pod.Namespace, pod.Name)
 	}
+	glog.V(3).Infof("Added pod <%s/%v> into cache.", pod.Namespace, pod.Name)
 	return
 }
 
@@ -234,14 +260,17 @@ func (sc *SchedulerCache) addNode(node *v1.Node) error {
 	if sc.Nodes[node.Name] != nil {
 		sc.Nodes[node.Name].SetNode(node)
 	} else {
-		sc.Nodes[node.Name] = arbapi.NewNodeInfo(node)
+		sc.Nodes[node.Name] = kbapi.NewNodeInfo(node)
 	}
 
 	return nil
 }
 
 func isNodeInfoUpdated(oldNode, newNode *v1.Node) bool {
-	return !reflect.DeepEqual(oldNode.Status.Allocatable, newNode.Status.Allocatable)
+	return !reflect.DeepEqual(oldNode.Status.Allocatable, newNode.Status.Allocatable) ||
+		!reflect.DeepEqual(oldNode.Spec.Taints, newNode.Spec.Taints) ||
+		!reflect.DeepEqual(oldNode.Labels, newNode.Labels) ||
+		!reflect.DeepEqual(oldNode.Spec.Unschedulable, newNode.Spec.Unschedulable)
 }
 
 // Assumes that lock is already acquired.
@@ -334,31 +363,40 @@ func (sc *SchedulerCache) DeleteNode(obj interface{}) {
 	return
 }
 
+func getJobID(pg *kbv1.PodGroup) kbapi.JobID {
+	return kbapi.JobID(fmt.Sprintf("%s/%s", pg.Namespace, pg.Name))
+}
+
 // Assumes that lock is already acquired.
-func (sc *SchedulerCache) setSchedulingSpec(ss *arbv1.SchedulingSpec) error {
-	job := arbapi.JobID(utils.GetController(ss))
+func (sc *SchedulerCache) setPodGroup(ss *kbv1.PodGroup) error {
+	job := getJobID(ss)
 
 	if len(job) == 0 {
-		return fmt.Errorf("the controller of SchedulingSpec is empty")
+		return fmt.Errorf("the identity of PodGroup is empty")
 	}
 
 	if _, found := sc.Jobs[job]; !found {
-		sc.Jobs[job] = arbapi.NewJobInfo(job)
+		sc.Jobs[job] = kbapi.NewJobInfo(job)
 	}
 
-	sc.Jobs[job].SetSchedulingSpec(ss)
+	sc.Jobs[job].SetPodGroup(ss)
+
+	// TODO(k82cn): set default queue in admission.
+	if len(ss.Spec.Queue) == 0 {
+		sc.Jobs[job].Queue = kbapi.QueueID(sc.defaultQueue)
+	}
 
 	return nil
 }
 
 // Assumes that lock is already acquired.
-func (sc *SchedulerCache) updateSchedulingSpec(oldQueue, newQueue *arbv1.SchedulingSpec) error {
-	return sc.setSchedulingSpec(newQueue)
+func (sc *SchedulerCache) updatePodGroup(oldQueue, newQueue *kbv1.PodGroup) error {
+	return sc.setPodGroup(newQueue)
 }
 
 // Assumes that lock is already acquired.
-func (sc *SchedulerCache) deleteSchedulingSpec(ss *arbv1.SchedulingSpec) error {
-	jobID := arbapi.JobID(utils.GetController(ss))
+func (sc *SchedulerCache) deletePodGroup(ss *kbv1.PodGroup) error {
+	jobID := getJobID(ss)
 
 	job, found := sc.Jobs[jobID]
 	if !found {
@@ -366,48 +404,48 @@ func (sc *SchedulerCache) deleteSchedulingSpec(ss *arbv1.SchedulingSpec) error {
 	}
 
 	// Unset SchedulingSpec
-	job.UnsetSchedulingSpec()
+	job.UnsetPodGroup()
 
 	sc.deleteJob(job)
 
 	return nil
 }
 
-func (sc *SchedulerCache) AddSchedulingSpec(obj interface{}) {
-	ss, ok := obj.(*arbv1.SchedulingSpec)
+func (sc *SchedulerCache) AddPodGroup(obj interface{}) {
+	ss, ok := obj.(*kbv1.PodGroup)
 	if !ok {
-		glog.Errorf("Cannot convert to *arbv1.Queue: %v", obj)
+		glog.Errorf("Cannot convert to *kbv1.PodGroup: %v", obj)
 		return
 	}
 
 	sc.Mutex.Lock()
 	defer sc.Mutex.Unlock()
 
-	glog.V(4).Infof("Add SchedulingSpec(%s) into cache, spec(%#v)", ss.Name, ss.Spec)
-	err := sc.setSchedulingSpec(ss)
+	glog.V(4).Infof("Add PodGroup(%s) into cache, spec(%#v)", ss.Name, ss.Spec)
+	err := sc.setPodGroup(ss)
 	if err != nil {
-		glog.Errorf("Failed to add SchedulingSpec %s into cache: %v", ss.Name, err)
+		glog.Errorf("Failed to add PodGroup %s into cache: %v", ss.Name, err)
 		return
 	}
 	return
 }
 
-func (sc *SchedulerCache) UpdateSchedulingSpec(oldObj, newObj interface{}) {
-	oldSS, ok := oldObj.(*arbv1.SchedulingSpec)
+func (sc *SchedulerCache) UpdatePodGroup(oldObj, newObj interface{}) {
+	oldSS, ok := oldObj.(*kbv1.PodGroup)
 	if !ok {
-		glog.Errorf("Cannot convert oldObj to *arbv1.SchedulingSpec: %v", oldObj)
+		glog.Errorf("Cannot convert oldObj to *kbv1.SchedulingSpec: %v", oldObj)
 		return
 	}
-	newSS, ok := newObj.(*arbv1.SchedulingSpec)
+	newSS, ok := newObj.(*kbv1.PodGroup)
 	if !ok {
-		glog.Errorf("Cannot convert newObj to *arbv1.SchedulingSpec: %v", newObj)
+		glog.Errorf("Cannot convert newObj to *kbv1.SchedulingSpec: %v", newObj)
 		return
 	}
 
 	sc.Mutex.Lock()
 	defer sc.Mutex.Unlock()
 
-	err := sc.updateSchedulingSpec(oldSS, newSS)
+	err := sc.updatePodGroup(oldSS, newSS)
 	if err != nil {
 		glog.Errorf("Failed to update SchedulingSpec %s into cache: %v", oldSS.Name, err)
 		return
@@ -415,27 +453,27 @@ func (sc *SchedulerCache) UpdateSchedulingSpec(oldObj, newObj interface{}) {
 	return
 }
 
-func (sc *SchedulerCache) DeleteSchedulingSpec(obj interface{}) {
-	var ss *arbv1.SchedulingSpec
+func (sc *SchedulerCache) DeletePodGroup(obj interface{}) {
+	var ss *kbv1.PodGroup
 	switch t := obj.(type) {
-	case *arbv1.SchedulingSpec:
+	case *kbv1.PodGroup:
 		ss = t
 	case cache.DeletedFinalStateUnknown:
 		var ok bool
-		ss, ok = t.Obj.(*arbv1.SchedulingSpec)
+		ss, ok = t.Obj.(*kbv1.PodGroup)
 		if !ok {
-			glog.Errorf("Cannot convert to *arbv1.SchedulingSpec: %v", t.Obj)
+			glog.Errorf("Cannot convert to *kbv1.SchedulingSpec: %v", t.Obj)
 			return
 		}
 	default:
-		glog.Errorf("Cannot convert to *arbv1.SchedulingSpec: %v", t)
+		glog.Errorf("Cannot convert to *kbv1.SchedulingSpec: %v", t)
 		return
 	}
 
 	sc.Mutex.Lock()
 	defer sc.Mutex.Unlock()
 
-	err := sc.deleteSchedulingSpec(ss)
+	err := sc.deletePodGroup(ss)
 	if err != nil {
 		glog.Errorf("Failed to delete SchedulingSpec %s from cache: %v", ss.Name, err)
 		return
@@ -445,17 +483,19 @@ func (sc *SchedulerCache) DeleteSchedulingSpec(obj interface{}) {
 
 // Assumes that lock is already acquired.
 func (sc *SchedulerCache) setPDB(pdb *policyv1.PodDisruptionBudget) error {
-	job := arbapi.JobID(utils.GetController(pdb))
+	job := kbapi.JobID(utils.GetController(pdb))
 
 	if len(job) == 0 {
 		return fmt.Errorf("the controller of PodDisruptionBudget is empty")
 	}
 
 	if _, found := sc.Jobs[job]; !found {
-		sc.Jobs[job] = arbapi.NewJobInfo(job)
+		sc.Jobs[job] = kbapi.NewJobInfo(job)
 	}
 
 	sc.Jobs[job].SetPDB(pdb)
+	// Set it to default queue, as PDB did not support queue right now.
+	sc.Jobs[job].Queue = kbapi.QueueID(sc.defaultQueue)
 
 	return nil
 }
@@ -467,7 +507,7 @@ func (sc *SchedulerCache) updatePDB(oldPDB, newPDB *policyv1.PodDisruptionBudget
 
 // Assumes that lock is already acquired.
 func (sc *SchedulerCache) deletePDB(pdb *policyv1.PodDisruptionBudget) error {
-	jobID := arbapi.JobID(utils.GetController(pdb))
+	jobID := kbapi.JobID(utils.GetController(pdb))
 
 	job, found := sc.Jobs[jobID]
 	if !found {
@@ -549,4 +589,189 @@ func (sc *SchedulerCache) DeletePDB(obj interface{}) {
 		return
 	}
 	return
+}
+
+func (sc *SchedulerCache) AddQueue(obj interface{}) {
+	ss, ok := obj.(*kbv1.Queue)
+	if !ok {
+		glog.Errorf("Cannot convert to *kbv1.Queue: %v", obj)
+		return
+	}
+
+	sc.Mutex.Lock()
+	defer sc.Mutex.Unlock()
+
+	glog.V(4).Infof("Add Queue(%s) into cache, spec(%#v)", ss.Name, ss.Spec)
+	err := sc.addQueue(ss)
+	if err != nil {
+		glog.Errorf("Failed to add Queue %s into cache: %v", ss.Name, err)
+		return
+	}
+	return
+}
+
+func (sc *SchedulerCache) UpdateQueue(oldObj, newObj interface{}) {
+	oldSS, ok := oldObj.(*kbv1.Queue)
+	if !ok {
+		glog.Errorf("Cannot convert oldObj to *kbv1.Queue: %v", oldObj)
+		return
+	}
+	newSS, ok := newObj.(*kbv1.Queue)
+	if !ok {
+		glog.Errorf("Cannot convert newObj to *kbv1.Queue: %v", newObj)
+		return
+	}
+
+	sc.Mutex.Lock()
+	defer sc.Mutex.Unlock()
+
+	err := sc.updateQueue(oldSS, newSS)
+	if err != nil {
+		glog.Errorf("Failed to update Queue %s into cache: %v", oldSS.Name, err)
+		return
+	}
+	return
+}
+
+func (sc *SchedulerCache) DeleteQueue(obj interface{}) {
+	var ss *kbv1.Queue
+	switch t := obj.(type) {
+	case *kbv1.Queue:
+		ss = t
+	case cache.DeletedFinalStateUnknown:
+		var ok bool
+		ss, ok = t.Obj.(*kbv1.Queue)
+		if !ok {
+			glog.Errorf("Cannot convert to *kbv1.Queue: %v", t.Obj)
+			return
+		}
+	default:
+		glog.Errorf("Cannot convert to *kbv1.Queue: %v", t)
+		return
+	}
+
+	sc.Mutex.Lock()
+	defer sc.Mutex.Unlock()
+
+	err := sc.deleteQueue(ss)
+	if err != nil {
+		glog.Errorf("Failed to delete Queue %s from cache: %v", ss.Name, err)
+		return
+	}
+	return
+}
+
+func (sc *SchedulerCache) addQueue(queue *kbv1.Queue) error {
+	qi := kbapi.NewQueueInfo(queue)
+	sc.Queues[qi.UID] = qi
+
+	return nil
+}
+
+func (sc *SchedulerCache) updateQueue(oldObj, newObj *kbv1.Queue) error {
+	sc.deleteQueue(oldObj)
+	sc.addQueue(newObj)
+
+	return nil
+}
+
+func (sc *SchedulerCache) deleteQueue(queue *kbv1.Queue) error {
+	qi := kbapi.NewQueueInfo(queue)
+	delete(sc.Queues, qi.UID)
+
+	return nil
+}
+
+func (sc *SchedulerCache) DeletePriorityClass(obj interface{}) {
+	var ss *v1beta1.PriorityClass
+	switch t := obj.(type) {
+	case *v1beta1.PriorityClass:
+		ss = t
+	case cache.DeletedFinalStateUnknown:
+		var ok bool
+		ss, ok = t.Obj.(*v1beta1.PriorityClass)
+		if !ok {
+			glog.Errorf("Cannot convert to *v1beta1.PriorityClass: %v", t.Obj)
+			return
+		}
+	default:
+		glog.Errorf("Cannot convert to *v1beta1.PriorityClass: %v", t)
+		return
+	}
+
+	sc.Mutex.Lock()
+	defer sc.Mutex.Unlock()
+
+	sc.deletePriorityClass(ss)
+}
+
+func (sc *SchedulerCache) UpdatePriorityClass(oldObj, newObj interface{}) {
+	oldSS, ok := oldObj.(*v1beta1.PriorityClass)
+	if !ok {
+		glog.Errorf("Cannot convert oldObj to *v1beta1.PriorityClass: %v", oldObj)
+
+		return
+
+	}
+
+	newSS, ok := newObj.(*v1beta1.PriorityClass)
+	if !ok {
+		glog.Errorf("Cannot convert newObj to *v1beta1.PriorityClass: %v", newObj)
+
+		return
+
+	}
+
+	sc.Mutex.Lock()
+	defer sc.Mutex.Unlock()
+
+	sc.deletePriorityClass(oldSS)
+	sc.addPriorityClass(newSS)
+}
+
+func (sc *SchedulerCache) AddPriorityClass(obj interface{}) {
+	var ss *v1beta1.PriorityClass
+	switch t := obj.(type) {
+	case *v1beta1.PriorityClass:
+		ss = t
+	case cache.DeletedFinalStateUnknown:
+		var ok bool
+		ss, ok = t.Obj.(*v1beta1.PriorityClass)
+		if !ok {
+			glog.Errorf("Cannot convert to *v1beta1.PriorityClass: %v", t.Obj)
+			return
+		}
+	default:
+		glog.Errorf("Cannot convert to *v1beta1.PriorityClass: %v", t)
+		return
+	}
+
+	sc.Mutex.Lock()
+	defer sc.Mutex.Unlock()
+
+	sc.addPriorityClass(ss)
+}
+
+func (sc *SchedulerCache) deletePriorityClass(pc *v1beta1.PriorityClass) {
+	if pc.GlobalDefault {
+		sc.defaultPriorityClass = nil
+		sc.defaultPriority = 0
+
+	}
+
+	delete(sc.PriorityClasses, pc.Name)
+}
+
+func (sc *SchedulerCache) addPriorityClass(pc *v1beta1.PriorityClass) {
+	if pc.GlobalDefault {
+		if sc.defaultPriorityClass != nil {
+			glog.Errorf("Updated default priority class from <%s> to <%s> forcefully.",
+				sc.defaultPriorityClass.Name, pc.Name)
+
+		}
+		sc.defaultPriorityClass = pc
+		sc.defaultPriority = pc.Value
+	}
+
+	sc.PriorityClasses[pc.Name] = pc
 }

@@ -35,15 +35,16 @@ func jobInfoEqual(l, r *JobInfo) bool {
 func TestAddTaskInfo(t *testing.T) {
 	// case1
 	case01_uid := JobID("uid")
+	case01_ns := "c1"
 	case01_owner := buildOwnerReference("uid")
 
-	case01_pod1 := buildPod("c1", "p1", "", v1.PodPending, buildResourceList("1000m", "1G"), []metav1.OwnerReference{case01_owner}, make(map[string]string))
+	case01_pod1 := buildPod(case01_ns, "p1", "", v1.PodPending, buildResourceList("1000m", "1G"), []metav1.OwnerReference{case01_owner}, make(map[string]string))
 	case01_task1 := NewTaskInfo(case01_pod1)
-	case01_pod2 := buildPod("c1", "p2", "n1", v1.PodRunning, buildResourceList("2000m", "2G"), []metav1.OwnerReference{case01_owner}, make(map[string]string))
+	case01_pod2 := buildPod(case01_ns, "p2", "n1", v1.PodRunning, buildResourceList("2000m", "2G"), []metav1.OwnerReference{case01_owner}, make(map[string]string))
 	case01_task2 := NewTaskInfo(case01_pod2)
-	case01_pod3 := buildPod("c1", "p3", "n1", v1.PodPending, buildResourceList("1000m", "1G"), []metav1.OwnerReference{case01_owner}, make(map[string]string))
+	case01_pod3 := buildPod(case01_ns, "p3", "n1", v1.PodPending, buildResourceList("1000m", "1G"), []metav1.OwnerReference{case01_owner}, make(map[string]string))
 	case01_task3 := NewTaskInfo(case01_pod3)
-	case01_pod4 := buildPod("c1", "p4", "n1", v1.PodPending, buildResourceList("1000m", "1G"), []metav1.OwnerReference{case01_owner}, make(map[string]string))
+	case01_pod4 := buildPod(case01_ns, "p4", "n1", v1.PodPending, buildResourceList("1000m", "1G"), []metav1.OwnerReference{case01_owner}, make(map[string]string))
 	case01_task4 := NewTaskInfo(case01_pod4)
 
 	tests := []struct {
@@ -58,7 +59,6 @@ func TestAddTaskInfo(t *testing.T) {
 			pods: []*v1.Pod{case01_pod1, case01_pod2, case01_pod3, case01_pod4},
 			expected: &JobInfo{
 				UID:          case01_uid,
-				MinAvailable: 0,
 				Allocated:    buildResource("4000m", "4G"),
 				TotalRequest: buildResource("5000m", "5G"),
 				Tasks: tasksMap{
@@ -79,7 +79,8 @@ func TestAddTaskInfo(t *testing.T) {
 						case01_task4.UID: case01_task4,
 					},
 				},
-				NodeSelector: make(map[string]string),
+				NodeSelector:  make(map[string]string),
+				NodesFitDelta: make(NodeResourceMap),
 			},
 		},
 	}
@@ -102,20 +103,22 @@ func TestAddTaskInfo(t *testing.T) {
 func TestDeleteTaskInfo(t *testing.T) {
 	// case1
 	case01_uid := JobID("owner1")
+	case01_ns := "c1"
 	case01_owner := buildOwnerReference(string(case01_uid))
-	case01_pod1 := buildPod("c1", "p1", "", v1.PodPending, buildResourceList("1000m", "1G"), []metav1.OwnerReference{case01_owner}, make(map[string]string))
+	case01_pod1 := buildPod(case01_ns, "p1", "", v1.PodPending, buildResourceList("1000m", "1G"), []metav1.OwnerReference{case01_owner}, make(map[string]string))
 	case01_task1 := NewTaskInfo(case01_pod1)
-	case01_pod2 := buildPod("c1", "p2", "n1", v1.PodRunning, buildResourceList("2000m", "2G"), []metav1.OwnerReference{case01_owner}, make(map[string]string))
-	case01_pod3 := buildPod("c1", "p3", "n1", v1.PodRunning, buildResourceList("3000m", "3G"), []metav1.OwnerReference{case01_owner}, make(map[string]string))
+	case01_pod2 := buildPod(case01_ns, "p2", "n1", v1.PodRunning, buildResourceList("2000m", "2G"), []metav1.OwnerReference{case01_owner}, make(map[string]string))
+	case01_pod3 := buildPod(case01_ns, "p3", "n1", v1.PodRunning, buildResourceList("3000m", "3G"), []metav1.OwnerReference{case01_owner}, make(map[string]string))
 	case01_task3 := NewTaskInfo(case01_pod3)
 
 	// case2
 	case02_uid := JobID("owner2")
+	case02_ns := "c2"
 	case02_owner := buildOwnerReference(string(case02_uid))
-	case02_pod1 := buildPod("c1", "p1", "", v1.PodPending, buildResourceList("1000m", "1G"), []metav1.OwnerReference{case02_owner}, make(map[string]string))
+	case02_pod1 := buildPod(case02_ns, "p1", "", v1.PodPending, buildResourceList("1000m", "1G"), []metav1.OwnerReference{case02_owner}, make(map[string]string))
 	case02_task1 := NewTaskInfo(case02_pod1)
-	case02_pod2 := buildPod("c1", "p2", "n1", v1.PodPending, buildResourceList("2000m", "2G"), []metav1.OwnerReference{case02_owner}, make(map[string]string))
-	case02_pod3 := buildPod("c1", "p3", "n1", v1.PodRunning, buildResourceList("3000m", "3G"), []metav1.OwnerReference{case02_owner}, make(map[string]string))
+	case02_pod2 := buildPod(case02_ns, "p2", "n1", v1.PodPending, buildResourceList("2000m", "2G"), []metav1.OwnerReference{case02_owner}, make(map[string]string))
+	case02_pod3 := buildPod(case02_ns, "p3", "n1", v1.PodRunning, buildResourceList("3000m", "3G"), []metav1.OwnerReference{case02_owner}, make(map[string]string))
 	case02_task3 := NewTaskInfo(case02_pod3)
 
 	tests := []struct {
@@ -132,7 +135,6 @@ func TestDeleteTaskInfo(t *testing.T) {
 			rmPods: []*v1.Pod{case01_pod2},
 			expected: &JobInfo{
 				UID:          case01_uid,
-				MinAvailable: 0,
 				Allocated:    buildResource("3000m", "3G"),
 				TotalRequest: buildResource("4000m", "4G"),
 				Tasks: tasksMap{
@@ -143,7 +145,8 @@ func TestDeleteTaskInfo(t *testing.T) {
 					Pending: {case01_task1.UID: case01_task1},
 					Running: {case01_task3.UID: case01_task3},
 				},
-				NodeSelector: make(map[string]string),
+				NodeSelector:  make(map[string]string),
+				NodesFitDelta: make(NodeResourceMap),
 			},
 		},
 		{
@@ -153,7 +156,6 @@ func TestDeleteTaskInfo(t *testing.T) {
 			rmPods: []*v1.Pod{case02_pod2},
 			expected: &JobInfo{
 				UID:          case02_uid,
-				MinAvailable: 0,
 				Allocated:    buildResource("3000m", "3G"),
 				TotalRequest: buildResource("4000m", "4G"),
 				Tasks: tasksMap{
@@ -168,7 +170,8 @@ func TestDeleteTaskInfo(t *testing.T) {
 						case02_task3.UID: case02_task3,
 					},
 				},
-				NodeSelector: make(map[string]string),
+				NodeSelector:  make(map[string]string),
+				NodesFitDelta: make(NodeResourceMap),
 			},
 		},
 	}

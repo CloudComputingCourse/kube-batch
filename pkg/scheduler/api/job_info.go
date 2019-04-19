@@ -18,14 +18,15 @@ package api
 
 import (
 	"fmt"
+	"sort"
+	"strings"
 
 	"k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
-	"github.com/kubernetes-incubator/kube-arbitrator/pkg/apis/utils"
-	arbv1 "github.com/kubernetes-incubator/kube-arbitrator/pkg/apis/v1alpha1"
+	"github.com/kubernetes-sigs/kube-batch/pkg/apis/scheduling/v1alpha1"
 )
 
 type TaskID types.UID
@@ -37,60 +38,76 @@ type TaskInfo struct {
 	Name      string
 	Namespace string
 
+	// Resreq is the resource that used when task running.
 	Resreq *Resource
+	// InitResreq is the resource that used to launch a task.
+	InitResreq *Resource
 
-	NodeName string
-	Status   TaskStatus
-	Priority int32
+	NodeName    string
+	Status      TaskStatus
+	Priority    int32
+	VolumeReady bool
 
 	Pod *v1.Pod
 }
 
-func NewTaskInfo(pod *v1.Pod) *TaskInfo {
-	req := EmptyResource()
-
-	// TODO(k82cn): also includes initContainers' resource.
-	for _, c := range pod.Spec.Containers {
-		req.Add(NewResource(c.Resources.Requests))
+func getJobID(pod *v1.Pod) JobID {
+	if len(pod.Annotations) != 0 {
+		if gn, found := pod.Annotations[v1alpha1.GroupNameAnnotationKey]; found && len(gn) != 0 {
+			// Make sure Pod and PodGroup belong to the same namespace.
+			jobID := fmt.Sprintf("%s/%s", pod.Namespace, gn)
+			return JobID(jobID)
+		}
 	}
 
-	pi := &TaskInfo{
-		UID:       TaskID(pod.UID),
-		Job:       JobID(utils.GetController(pod)),
-		Name:      pod.Name,
-		Namespace: pod.Namespace,
-		NodeName:  pod.Spec.NodeName,
-		Status:    getTaskStatus(pod),
-		Priority:  1,
+	return ""
+}
 
-		Pod:    pod,
-		Resreq: req,
+func NewTaskInfo(pod *v1.Pod) *TaskInfo {
+	req := GetPodResourceWithoutInitContainers(pod)
+	initResreq := GetPodResourceRequest(pod)
+
+	jobID := getJobID(pod)
+
+	ti := &TaskInfo{
+		UID:        TaskID(pod.UID),
+		Job:        jobID,
+		Name:       pod.Name,
+		Namespace:  pod.Namespace,
+		NodeName:   pod.Spec.NodeName,
+		Status:     getTaskStatus(pod),
+		Priority:   1,
+		Pod:        pod,
+		Resreq:     req,
+		InitResreq: initResreq,
 	}
 
 	if pod.Spec.Priority != nil {
-		pi.Priority = *pod.Spec.Priority
+		ti.Priority = *pod.Spec.Priority
 	}
 
-	return pi
+	return ti
 }
 
-func (pi *TaskInfo) Clone() *TaskInfo {
+func (ti *TaskInfo) Clone() *TaskInfo {
 	return &TaskInfo{
-		UID:       pi.UID,
-		Job:       pi.Job,
-		Name:      pi.Name,
-		Namespace: pi.Namespace,
-		NodeName:  pi.NodeName,
-		Status:    pi.Status,
-		Priority:  pi.Priority,
-		Pod:       pi.Pod,
-		Resreq:    pi.Resreq.Clone(),
+		UID:         ti.UID,
+		Job:         ti.Job,
+		Name:        ti.Name,
+		Namespace:   ti.Namespace,
+		NodeName:    ti.NodeName,
+		Status:      ti.Status,
+		Priority:    ti.Priority,
+		Pod:         ti.Pod,
+		Resreq:      ti.Resreq.Clone(),
+		InitResreq:  ti.InitResreq.Clone(),
+		VolumeReady: ti.VolumeReady,
 	}
 }
 
-func (pi TaskInfo) String() string {
+func (ti TaskInfo) String() string {
 	return fmt.Sprintf("Task (%v:%v/%v): job %v, status %v, pri %v, resreq %v",
-		pi.UID, pi.Namespace, pi.Name, pi.Job, pi.Status, pi.Priority, pi.Resreq)
+		ti.UID, ti.Namespace, ti.Name, ti.Job, ti.Status, ti.Priority, ti.Resreq)
 }
 
 // JobID is the type of JobInfo's ID.
@@ -98,16 +115,22 @@ type JobID types.UID
 
 type tasksMap map[TaskID]*TaskInfo
 
+type NodeResourceMap map[string]*Resource
+
 type JobInfo struct {
 	UID JobID
 
 	Name      string
 	Namespace string
 
-	Priority int
+	Queue QueueID
+
+	Priority int32
 
 	NodeSelector map[string]string
-	MinAvailable int
+	MinAvailable int32
+
+	NodesFitDelta NodeResourceMap
 
 	// All tasks of the Job.
 	TaskStatusIndex map[TaskStatus]tasksMap
@@ -116,9 +139,10 @@ type JobInfo struct {
 	Allocated    *Resource
 	TotalRequest *Resource
 
-	SchedSpec *arbv1.SchedulingSpec
+	CreationTimestamp metav1.Time
+	PodGroup          *v1alpha1.PodGroup
 
-	// TODO(k82cn): keep backward compatbility, removed it when v1alpha1 finalized.
+	// TODO(k82cn): keep backward compatibility, removed it when v1alpha1 finalized.
 	PDB *policyv1.PodDisruptionBudget
 
 	// Custom properties
@@ -130,49 +154,59 @@ type JobInfo struct {
 	CreationTime metav1.Time
 }
 
-func NewJobInfo(uid JobID) *JobInfo {
-	return &JobInfo{
+func NewJobInfo(uid JobID, tasks ...*TaskInfo) *JobInfo {
+	job := &JobInfo{
 		UID: uid,
 
-		MinAvailable: 0,
-		NodeSelector: make(map[string]string),
-
-		Allocated:    EmptyResource(),
-		TotalRequest: EmptyResource(),
+		MinAvailable:  0,
+		NodeSelector:  make(map[string]string),
+		NodesFitDelta: make(NodeResourceMap),
+		Allocated:     EmptyResource(),
+		TotalRequest:  EmptyResource(),
 
 		TaskStatusIndex: map[TaskStatus]tasksMap{},
 		Tasks:           tasksMap{},
 	}
+
+	for _, task := range tasks {
+		job.AddTaskInfo(task)
+	}
+
+	return job
 }
 
-func (ps *JobInfo) UnsetSchedulingSpec() {
-	ps.SchedSpec = nil
+func (ji *JobInfo) UnsetPodGroup() {
+	ji.PodGroup = nil
 }
 
-func (ps *JobInfo) SetSchedulingSpec(spec *arbv1.SchedulingSpec) {
-	ps.Name = spec.Name
-	ps.Namespace = spec.Namespace
-	ps.MinAvailable = spec.Spec.MinAvailable
+func (ji *JobInfo) SetPodGroup(pg *v1alpha1.PodGroup) {
+	ji.Name = pg.Name
+	ji.Namespace = pg.Namespace
+	ji.MinAvailable = pg.Spec.MinMember
+	ji.Queue = QueueID(pg.Spec.Queue)
+	ji.CreationTimestamp = pg.GetCreationTimestamp()
 
-	ps.SchedSpec = spec
+	ji.PodGroup = pg
 }
 
-func (ps *JobInfo) SetPDB(pbd *policyv1.PodDisruptionBudget) {
-	ps.Name = pbd.Name
-	ps.MinAvailable = int(pbd.Spec.MinAvailable.IntVal)
+func (ji *JobInfo) SetPDB(pdb *policyv1.PodDisruptionBudget) {
+	ji.Name = pdb.Name
+	ji.MinAvailable = pdb.Spec.MinAvailable.IntVal
+	ji.Namespace = pdb.Namespace
 
-	ps.PDB = pbd
+	ji.CreationTimestamp = pdb.GetCreationTimestamp()
+	ji.PDB = pdb
 }
 
-func (ps *JobInfo) UnsetPDB() {
-	ps.PDB = nil
+func (ji *JobInfo) UnsetPDB() {
+	ji.PDB = nil
 }
 
-func (ps *JobInfo) GetTasks(statuses ...TaskStatus) []*TaskInfo {
+func (ji *JobInfo) GetTasks(statuses ...TaskStatus) []*TaskInfo {
 	var res []*TaskInfo
 
 	for _, status := range statuses {
-		if tasks, found := ps.TaskStatusIndex[status]; found {
+		if tasks, found := ji.TaskStatusIndex[status]; found {
 			for _, task := range tasks {
 				res = append(res, task.Clone())
 			}
@@ -182,102 +216,144 @@ func (ps *JobInfo) GetTasks(statuses ...TaskStatus) []*TaskInfo {
 	return res
 }
 
-func (ps *JobInfo) addTaskIndex(pi *TaskInfo) {
-	if _, found := ps.TaskStatusIndex[pi.Status]; !found {
-		ps.TaskStatusIndex[pi.Status] = tasksMap{}
+func (ji *JobInfo) addTaskIndex(ti *TaskInfo) {
+	if _, found := ji.TaskStatusIndex[ti.Status]; !found {
+		ji.TaskStatusIndex[ti.Status] = tasksMap{}
 	}
 
-	ps.TaskStatusIndex[pi.Status][pi.UID] = pi
+	ji.TaskStatusIndex[ti.Status][ti.UID] = ti
 }
 
-func (ps *JobInfo) AddTaskInfo(pi *TaskInfo) {
-	ps.Tasks[pi.UID] = pi
-	ps.addTaskIndex(pi)
+func (ji *JobInfo) AddTaskInfo(ti *TaskInfo) {
+	ji.Tasks[ti.UID] = ti
+	ji.addTaskIndex(ti)
 
-	ps.TotalRequest.Add(pi.Resreq)
+	ji.TotalRequest.Add(ti.Resreq)
 
-	if AllocatedStatus(pi.Status) {
-		ps.Allocated.Add(pi.Resreq)
+	if AllocatedStatus(ti.Status) {
+		ji.Allocated.Add(ti.Resreq)
 	}
 }
 
-func (ps *JobInfo) UpdateTaskStatus(task *TaskInfo, status TaskStatus) error {
+func (ji *JobInfo) UpdateTaskStatus(task *TaskInfo, status TaskStatus) error {
 	if err := validateStatusUpdate(task.Status, status); err != nil {
 		return err
 	}
 
 	// Remove the task from the task list firstly
-	ps.DeleteTaskInfo(task)
+	ji.DeleteTaskInfo(task)
 
 	// Update task's status to the target status
 	task.Status = status
-	ps.AddTaskInfo(task)
+	ji.AddTaskInfo(task)
 
 	return nil
 }
 
-func (ps *JobInfo) deleteTaskIndex(ti *TaskInfo) {
-	if tasks, found := ps.TaskStatusIndex[ti.Status]; found {
+func (ji *JobInfo) deleteTaskIndex(ti *TaskInfo) {
+	if tasks, found := ji.TaskStatusIndex[ti.Status]; found {
 		delete(tasks, ti.UID)
 
 		if len(tasks) == 0 {
-			delete(ps.TaskStatusIndex, ti.Status)
+			delete(ji.TaskStatusIndex, ti.Status)
 		}
 	}
 }
 
-func (ps *JobInfo) DeleteTaskInfo(pi *TaskInfo) error {
-	if task, found := ps.Tasks[pi.UID]; found {
-		ps.TotalRequest.Sub(task.Resreq)
+func (ji *JobInfo) DeleteTaskInfo(ti *TaskInfo) error {
+	if task, found := ji.Tasks[ti.UID]; found {
+		ji.TotalRequest.Sub(task.Resreq)
 
 		if AllocatedStatus(task.Status) {
-			ps.Allocated.Sub(task.Resreq)
+			ji.Allocated.Sub(task.Resreq)
 		}
 
-		delete(ps.Tasks, task.UID)
+		delete(ji.Tasks, task.UID)
 
-		ps.deleteTaskIndex(task)
+		ji.deleteTaskIndex(task)
 		return nil
 	}
 
 	return fmt.Errorf("failed to find task <%v/%v> in job <%v/%v>",
-		pi.Namespace, pi.Name, ps.Namespace, ps.Name)
+		ti.Namespace, ti.Name, ji.Namespace, ji.Name)
 }
 
-func (ps *JobInfo) Clone() *JobInfo {
+func (ji *JobInfo) Clone() *JobInfo {
 	info := &JobInfo{
-		UID:       ps.UID,
-		Name:      ps.Name,
-		Namespace: ps.Namespace,
+		UID:       ji.UID,
+		Name:      ji.Name,
+		Namespace: ji.Namespace,
+		Queue:     ji.Queue,
+		Priority:  ji.Priority,
 
-		MinAvailable: ps.MinAvailable,
-		NodeSelector: map[string]string{},
-		Allocated:    ps.Allocated.Clone(),
-		TotalRequest: ps.TotalRequest.Clone(),
+		MinAvailable:  ji.MinAvailable,
+		NodeSelector:  map[string]string{},
+		Allocated:     EmptyResource(),
+		TotalRequest:  EmptyResource(),
+		NodesFitDelta: make(NodeResourceMap),
+
+		PDB:      ji.PDB,
+		PodGroup: ji.PodGroup,
 
 		TaskStatusIndex: map[TaskStatus]tasksMap{},
 		Tasks:           tasksMap{},
 	}
 
-	for k, v := range ps.NodeSelector {
+	ji.CreationTimestamp.DeepCopyInto(&info.CreationTimestamp)
+
+	for k, v := range ji.NodeSelector {
 		info.NodeSelector[k] = v
 	}
 
-	for _, task := range ps.Tasks {
+	for _, task := range ji.Tasks {
 		info.AddTaskInfo(task.Clone())
 	}
 
 	return info
 }
 
-func (ps JobInfo) String() string {
+func (ji JobInfo) String() string {
 	res := ""
 
 	i := 0
-	for _, task := range ps.Tasks {
+	for _, task := range ji.Tasks {
 		res = res + fmt.Sprintf("\n\t %d: %v", i, task)
 		i++
 	}
 
-	return fmt.Sprintf("Job (%v): name %v, minAvailable %d", ps.UID, ps.Name, ps.MinAvailable) + res
+	return fmt.Sprintf("Job (%v): namespace %v (%v), name %v, minAvailable %d, podGroup %+v",
+		ji.UID, ji.Namespace, ji.Queue, ji.Name, ji.MinAvailable, ji.PodGroup) + res
+}
+
+// Error returns detailed information on why a job's task failed to fit on
+// each available node
+func (ji *JobInfo) FitError() string {
+	if len(ji.NodesFitDelta) == 0 {
+		reasonMsg := fmt.Sprintf("0 nodes are available")
+		return reasonMsg
+	}
+
+	reasons := make(map[string]int)
+	for _, v := range ji.NodesFitDelta {
+		if v.Get(v1.ResourceCPU) < 0 {
+			reasons["cpu"]++
+		}
+		if v.Get(v1.ResourceMemory) < 0 {
+			reasons["memory"]++
+		}
+		if v.Get(GPUResourceName) < 0 {
+			reasons["GPU"]++
+		}
+	}
+
+	sortReasonsHistogram := func() []string {
+		reasonStrings := []string{}
+		for k, v := range reasons {
+			reasonStrings = append(reasonStrings, fmt.Sprintf("%v insufficient %v", v, k))
+		}
+		sort.Strings(reasonStrings)
+		return reasonStrings
+	}
+	reasonMsg := fmt.Sprintf("0/%v nodes are available, %v.", len(ji.NodesFitDelta), strings.Join(sortReasonsHistogram(), ", "))
+	return reasonMsg
 }

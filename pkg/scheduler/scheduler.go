@@ -21,33 +21,36 @@ import (
 
 	"github.com/golang/glog"
 
-	apiextensionsclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/rest"
 
-	"github.com/kubernetes-incubator/kube-arbitrator/pkg/client"
-	schedcache "github.com/kubernetes-incubator/kube-arbitrator/pkg/scheduler/cache"
-	"github.com/kubernetes-incubator/kube-arbitrator/pkg/scheduler/framework"
+	schedcache "github.com/kubernetes-sigs/kube-batch/pkg/scheduler/cache"
+	"github.com/kubernetes-sigs/kube-batch/pkg/scheduler/conf"
+	"github.com/kubernetes-sigs/kube-batch/pkg/scheduler/framework"
+	"github.com/kubernetes-sigs/kube-batch/pkg/scheduler/metrics"
 )
 
 type Scheduler struct {
-	cache         schedcache.Cache
-	config        *rest.Config
-	actions       []framework.Action
-	pluginArgs    []*framework.PluginArgs
-	schedulerConf string
+	cache          schedcache.Cache
+	config         *rest.Config
+	actions        []framework.Action
+	plugins        []conf.Tier
+	schedulerConf  string
+	schedulePeriod time.Duration
 }
 
 func NewScheduler(
 	config *rest.Config,
 	schedulerName string,
 	conf string,
+	period time.Duration,
+	defaultQueue string,
 ) (*Scheduler, error) {
 	scheduler := &Scheduler{
-		config:        config,
-		schedulerConf: conf,
-		cache:         schedcache.New(config, schedulerName),
+		config:         config,
+		schedulerConf:  conf,
+		cache:          schedcache.New(config, schedulerName, defaultQueue),
+		schedulePeriod: period,
 	}
 
 	return scheduler, nil
@@ -56,51 +59,40 @@ func NewScheduler(
 func (pc *Scheduler) Run(stopCh <-chan struct{}) {
 	var err error
 
-	createSchedulingSpecKind(pc.config)
-
 	// Start cache for policy.
 	go pc.cache.Run(stopCh)
 	pc.cache.WaitForCacheSync(stopCh)
 
 	// Load configuration of scheduler
-	conf := defaultSchedulerConf
+	schedConf := defaultSchedulerConf
 	if len(pc.schedulerConf) != 0 {
-		if conf, err = pc.cache.LoadSchedulerConf(pc.schedulerConf); err != nil {
-			glog.Errorf("Failed to load scheduler configuration '%s', using default configuration: %v",
+		if schedConf, err = readSchedulerConf(pc.schedulerConf); err != nil {
+			glog.Errorf("Failed to read scheduler configuration '%s', using default configuration: %v",
 				pc.schedulerConf, err)
+			schedConf = defaultSchedulerConf
 		}
 	}
 
-	pc.actions, pc.pluginArgs = loadSchedulerConf(conf)
+	pc.actions, pc.plugins, err = loadSchedulerConf(schedConf)
+	if err != nil {
+		panic(err)
+	}
 
-	go wait.Until(pc.runOnce, 1*time.Second, stopCh)
+	go wait.Until(pc.runOnce, pc.schedulePeriod, stopCh)
 }
 
 func (pc *Scheduler) runOnce() {
 	glog.V(4).Infof("Start scheduling ...")
+	scheduleStartTime := time.Now()
 	defer glog.V(4).Infof("End scheduling ...")
+	defer metrics.UpdateE2eDuration(metrics.Duration(scheduleStartTime))
 
-	ssn := framework.OpenSession(pc.cache, pc.pluginArgs)
+	ssn := framework.OpenSession(pc.cache, pc.plugins)
 	defer framework.CloseSession(ssn)
 
-	if glog.V(3) {
-		glog.V(3).Infof("%v", ssn)
-	}
-
 	for _, action := range pc.actions {
+		actionStartTime := time.Now()
 		action.Execute(ssn)
+		metrics.UpdateActionDuration(action.Name(), metrics.Duration(actionStartTime))
 	}
-
-}
-
-func createSchedulingSpecKind(config *rest.Config) error {
-	extensionscs, err := apiextensionsclient.NewForConfig(config)
-	if err != nil {
-		return err
-	}
-	_, err = client.CreateSchedulingSpecKind(extensionscs)
-	if err != nil && !apierrors.IsAlreadyExists(err) {
-		return err
-	}
-	return nil
 }

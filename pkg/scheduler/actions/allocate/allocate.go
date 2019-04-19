@@ -17,19 +17,21 @@ limitations under the License.
 package allocate
 
 import (
-	"k8s.io/apimachinery/pkg/labels"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 
 	"github.com/golang/glog"
 
-	"github.com/kubernetes-incubator/kube-arbitrator/pkg/scheduler/api"
-	"github.com/kubernetes-incubator/kube-arbitrator/pkg/scheduler/framework"
-	"github.com/kubernetes-incubator/kube-arbitrator/pkg/scheduler/util"
+	"github.com/kubernetes-sigs/kube-batch/pkg/scheduler/api"
+	"github.com/kubernetes-sigs/kube-batch/pkg/scheduler/framework"
+	"github.com/kubernetes-sigs/kube-batch/pkg/scheduler/util"
 
-	"strconv"
-	"os"
-	"fmt"
 	"encoding/json"
+	"fmt"
+	"os"
+	"reflect"
+	"sort"
+	"strconv"
 )
 
 type JobT struct {
@@ -116,19 +118,6 @@ func getOneTask(job *api.JobInfo) *api.TaskInfo {
 	return nil
 }
 
-func jobOrderFn(l, r interface{}) int {
-	lv := l.(*api.JobInfo)
-	rv := r.(*api.JobInfo)
-	lc := lv.CreationTime
-	rc := rv.CreationTime
-	if lc.Before(&rc) {
-		glog.V(3).Infof("%s (%v) before %s (%v)", lv.Name, lc, rv.Name, rc)
-		return -1
-	}
-	glog.V(3).Infof("%s (%v) before %s (%v)", rv.Name, rc, lv.Name, lc)
-	return 1
-}
-
 func prepareInput(jobs []*api.JobInfo, nodes []*api.NodeInfo, nodesAvailable map[string]*api.NodeInfo) InputT {
 	var input InputT
 
@@ -156,7 +145,7 @@ func prepareInput(jobs []*api.JobInfo, nodes []*api.NodeInfo, nodesAvailable map
 	for _, job := range jobs {
 		var queueJob JobT
 		queueJob.JobID = job.ID
-		queueJob.K = job.MinAvailable
+		queueJob.K = int(job.MinAvailable)
 		queueJob.JobType = job.Type
 		queueJob.Duration = job.FastDuration
 		queueJob.SlowDuration = job.SlowDuration
@@ -168,8 +157,14 @@ func prepareInput(jobs []*api.JobInfo, nodes []*api.NodeInfo, nodesAvailable map
 		input.Machines = append(input.Machines, node.ID)
 	}
 
+	sort.Ints(input.Machines)
+
 	return input
 }
+
+// keep track of input and output in the previous allocation decision
+var prevInput InputT
+var prevOutput OutputT
 
 func (alloc *allocateAction) Execute(ssn *framework.Session) {
 	glog.V(3).Infof("Enter Allocate...")
@@ -192,12 +187,12 @@ func (alloc *allocateAction) Execute(ssn *framework.Session) {
 	}
 
 	// Prepare job queue
-	ssn.AddJobOrderFn(jobOrderFn)
 	jobQueue := util.NewPriorityQueue(ssn.JobOrderFn)
 	var trace string
 	var t *api.TaskInfo
 	for _, job := range ssn.Jobs {
-		if len(job.TaskStatusIndex[api.Pending]) >= job.MinAvailable {
+		numPendingTasks := len(job.TaskStatusIndex[api.Pending])
+		if numPendingTasks >= int(job.MinAvailable) {
 			job = addJobProperty(job)
 			jobQueue.Push(job)
 			if trace == "" {
@@ -205,19 +200,18 @@ func (alloc *allocateAction) Execute(ssn *framework.Session) {
 			} else if trace != job.Trace {
 				glog.Errorf("Found multiple traces (%v, %v) in Session %v",
 					trace, job.Trace, ssn.UID)
-
 			}
 			if t == nil {
 				t = getOneTask(job)
 			}
 		} else {
-			glog.V(3).Infof("Job <%v, %v> has %v tasks pending but requires %v tasks.",
-				job.Namespace, job.Name, len(job.TaskStatusIndex[api.Pending]), job.MinAvailable)
+			glog.V(3).Infof("Job <%v, %v> has %v tasks pending but requires %v tasks (creation in progress?).",
+				job.Namespace, job.Name, numPendingTasks, job.MinAvailable)
 		}
 	}
 
 	if jobQueue.Empty() {
-		glog.V(3).Infof("No jobs awaiting, skipping policy")
+		glog.V(3).Infof("No jobs awaiting, DONE")
 		return
 	}
 
@@ -253,7 +247,7 @@ func (alloc *allocateAction) Execute(ssn *framework.Session) {
 	}
 
 	if len(nodesAvailable) <= 0 {
-		glog.V(3).Infof("No nodes available, skipping policy")
+		glog.V(3).Infof("No nodes available, DONE")
 		return
 	}
 
@@ -266,86 +260,116 @@ func (alloc *allocateAction) Execute(ssn *framework.Session) {
 		}
 	}
 
-	// Prepare policy input for grader json
-	input := prepareInput(jobs, nodes, nodesAvailable)
+	nothingScheduled := true
+	var input InputT
 
-	// Call policy function to get allocation for first job
-	allocation := policyFn(jobs, nodes)
+	for { // repeat until no more jobs can be scheduled (one job per iteration)
+		// Prepare policy input for grader json
+		input = prepareInput(jobs, nodes, nodesAvailable)
 
-	for len(allocation) != 0 {
-	        var output OutputT
+		// Call policy function to get allocation
+		allocation := policyFn(jobs, nodes)
 
-		// Check allocation to get a clean (possible) placement
-		cleaned := make(map[*api.TaskInfo]*api.NodeInfo)
-		used := make(map[*api.NodeInfo]bool)
+		if len(allocation) == 0 { // nothing could be scheduled
+			break
+		}
+
+		// Validate allocation returned by the policy
+		var jobAllocated *api.JobInfo
+		var jobAllocatedIdx int
+		validAllocation := true
+		// Tasks don't include reference to job, so need to traverse all jobs and tasks
 		for idx, job := range jobs {
-			allocated := true
-			first := true
-			tempused := make(map[*api.NodeInfo]bool)
+			nodeInUse := make(map[*api.NodeInfo]bool)
 			for _, task := range job.TaskStatusIndex[api.Pending] {
-				node, ok := allocation[task]
-				if ok && (!task.Resreq.LessEqual(node.Idle) || used[node] || tempused[node]) {
-					glog.Errorf("Not enough idle resource on %v to bind Task <%v/%v> in Session %v",
-						node.Name, task.Namespace, task.Name, ssn.UID)
-					ok = false
+				node, taskAllocated := allocation[task]
+				if taskAllocated { // task found in allocation
+					nothingScheduled = false
+					if jobAllocated == nil {
+						jobAllocated = job // we found the job
+						jobAllocatedIdx = idx
+					} else { // we already found allocated task before, check if they match
+						if job != jobAllocated { // allocated included multiple jobs
+							validAllocation = false
+							glog.Errorf("ERROR! Allocation included both Job %v and %v.",
+								jobAllocated.Name, job.Name)
+							break
+						}
+					}
+					if nodeInUse[node] {
+						validAllocation = false
+						glog.Errorf("ERROR! Could not allocate Task <%v/%v>: Node %v already in use",
+							task.Namespace, task.Name, node.Name)
+						break
+					}
+					if !task.Resreq.LessEqual(node.Idle) {
+						validAllocation = false
+						glog.Errorf("ERROR! Could not allocate Task <%v/%v>: node enough idle resources in Node %v",
+							task.Namespace, task.Name, node.Name)
+						break
+					}
+					nodeInUse[node] = true
+				} else { // task not allocated by the policy
+					if jobAllocated != nil { // some task from this job was allocated, but this task wasn't
+						validAllocation = false
+						glog.Errorf("ERROR! Job %v partially allocated", job.Name)
+						break
+					} else {
+						// can contiue to the next task 
+						// not skipping the entire job, to detect partial allocations
+						continue
+					}
 				}
-				if !ok && !first && allocated {
-					allocated = false
-					glog.Errorf("Job <%v/%v> partially allocated, ignored", job.Namespace, job.Name)
-					break
-				} else if !ok {
-					allocated = false
-				} else if !allocated {
-					glog.Errorf("Job <%v/%v> partially allocated, ignored", job.Namespace, job.Name)
-					break
-				}
-				tempused[node] = true
-				first = false
 			}
-			if allocated {
-				output.JobID = job.ID
-				for _, task := range job.TaskStatusIndex[api.Pending] {
-					output.Machines = append(output.Machines, allocation[task].ID)
-					cleaned[task] = allocation[task]
-					used[allocation[task]] = true
-					delete(nodesAvailable, allocation[task].Node.ObjectMeta.Name)
-				}
-				jobs = append(jobs[: idx], jobs[idx + 1 :]...)
-				glog.Infof("Exactly 1 job found in allocation, ignoring the rest (if any)")
-				break; // Allocate tasks of one job at a time
-			}
-		}
-
-		// Marshal policy input and output to json and write to file
-		var message Message
-		message.Input = input
-		if len(output.Machines) != 0 {
-			message.Output = output
-		}
-		b, _ := json.Marshal(message)
-		traceFile, _ := os.OpenFile(fmt.Sprintf("/tmp/trace-%s.json", trace), os.O_APPEND | os.O_CREATE | os.O_WRONLY, 0644)
-		traceFile.Write(append(b, ','))
-		traceFile.Close()
-
-		// Allocate tasks
-		for task, node := range cleaned {
-			glog.V(3).Infof("Try to bind Task <%v/%v> to Node <%v>: <%v> vs. <%v>",
-				task.Namespace, task.Name, node.Name, task.Resreq, node.Idle)
-
-			// Allocate idle resource to the task.
-			glog.V(3).Infof("Binding Task <%v/%v> to node <%v>",
-				task.Namespace, task.Name, node.Name)
-			if err := ssn.Allocate(task, node.Name); err != nil {
-				glog.Errorf("Failed to bind Task %v on %v in Session %v",
-					task.UID, node.Name, ssn.UID)
-			} else {
-				ssn.UpdateScheduledTime(task)
+			if jobAllocated != nil { // allocation included task(s) from this job
+				break // no need to check other jobs
 			}
 		}
 
+		if jobAllocated == nil {
+			// returned allocation does not contain tasks of a valid job from the queue
+			// no point to retry with the same inputs - exit the loop
+			break
+		}
+
+		// prepare output for grader
+		var output OutputT
+		output.JobID = jobAllocated.ID
+		// find nodes in the returned allocation that belong to <jobAllocated>
+		for _, task := range jobAllocated.TaskStatusIndex[api.Pending] {
+			node, found := allocation[task]
+			if found {
+				output.Machines = append(output.Machines, node.ID)
+			}
+		}
+
+		// Record scheduling decision in a json file
+		recordDecision(input,output,trace)
+
+		if validAllocation {
+			// Allocate tasks
+			for task, node := range allocation {
+				glog.V(3).Infof("Try to bind Task <%v/%v> to Node <%v>: <%v> vs. <%v>",
+					task.Namespace, task.Name, node.Name, task.Resreq, node.Idle)
+				if err := ssn.Allocate(task, node.Name); err != nil {
+					glog.Errorf("ERROR! Failed to bind Task %v on %v in Session %v",
+						task.UID, node.Name, ssn.UID)
+				} else {
+					ssn.UpdateScheduledTime(task)
+					// update nodesAvailable for next iteration
+					delete(nodesAvailable, node.Name)
+				}
+			}
+		}
+
+		// remove the allocated job from the list passed to the policy in the next loop iteration
+		// if allocation was not valid, the job will be considered again next time Execute() is called
+		jobs = append(jobs[:jobAllocatedIdx], jobs[jobAllocatedIdx+1:]...)
+
+		// if no more jobs or nodes, exit the loop
 		if len(jobs) == 0 {
-			glog.V(3).Infof("No jobs awaiting, skipping policy")
-			return
+			glog.V(3).Infof("No jobs awaiting, DONE")
+			break
 		}
 
 		glog.V(3).Infof("%v jobs awaiting:", len(jobs))
@@ -354,8 +378,8 @@ func (alloc *allocateAction) Execute(ssn *framework.Session) {
 		}
 
 		if len(nodesAvailable) <= 0 {
-			glog.V(3).Infof("No nodes available, skipping policy")
-			return
+			glog.V(3).Infof("No nodes available, DONE")
+			break
 		}
 
 		glog.V(3).Infof("%v/%v nodes available:", len(nodesAvailable), len(nodes))
@@ -366,23 +390,47 @@ func (alloc *allocateAction) Execute(ssn *framework.Session) {
 				glog.V(3).Infof("    <%v>", node.Name)
 			}
 		}
-
-		// Prepare policy input for grader json
-		input = prepareInput(jobs, nodes, nodesAvailable)
-
-		// Call policy function to get allocation for next job
-		allocation = policyFn(jobs, nodes)
-
 	}
+	if nothingScheduled { // if nothing scheduled, record empty scheduling decision
+		var output OutputT // empty
+		recordDecision(input,output,trace)
+	}
+}
 
-	// Marshal policy input and empty output to json and write to file
+func recordDecision(input InputT, output OutputT, trace string) {
+	// Marshal policy input and output to json and write to file
 	var message Message
 	message.Input = input
-	b, _ := json.Marshal(message)
-	traceFile, _ := os.OpenFile(fmt.Sprintf("/tmp/trace-%s.json", trace), os.O_APPEND | os.O_CREATE | os.O_WRONLY, 0644)
-	traceFile.Write(append(b, ','))
-	traceFile.Close()
-
+	if len(output.Machines)>0 {
+		sort.Ints(output.Machines)
+		message.Output = output
+	}
+	// save only if input is different than the previous one
+	if !reflect.DeepEqual(input,prevInput) || !reflect.DeepEqual(output,prevOutput) {
+		jobsInfo := []int{}
+		for _,jq  := range(input.Queue) {
+			jobsInfo = append(jobsInfo, jq.JobID)
+		}
+		sort.Ints(jobsInfo)
+		nodesInfo := input.Machines
+		sort.Ints(nodesInfo)
+		if len(output.Machines)>0 {
+			glog.Infof("Policy scheduled JobID=%v to %v (Input queue: %v, nodes: %v)",
+				output.JobID, output.Machines, jobsInfo, nodesInfo)
+		} else {
+			glog.Infof("Policy could not schedule any job (Input queue: %v, nodes: %v)",
+				jobsInfo, nodesInfo)
+		}
+		b, _ := json.Marshal(message)
+		traceFile, _ := os.OpenFile(fmt.Sprintf("/tmp/trace-%s.json", trace), os.O_APPEND | os.O_CREATE | os.O_WRONLY, 0644)
+		traceFile.Write(append(b, ','))
+		traceFile.Close()
+	} else {
+		glog.V(3).Infof("Same input, skip recording")
+	}
+	// remember input and output, to avoid saving identical scheduling decisions
+	prevInput = input
+	prevOutput = output
 }
 
 func (alloc *allocateAction) UnInitialize() {}

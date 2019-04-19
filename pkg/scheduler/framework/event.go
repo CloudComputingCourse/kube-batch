@@ -17,7 +17,7 @@ limitations under the License.
 package framework
 
 import (
-	"github.com/kubernetes-incubator/kube-arbitrator/pkg/scheduler/api"
+	"github.com/kubernetes-sigs/kube-batch/pkg/scheduler/api"
 )
 
 type Event struct {
@@ -25,6 +25,6 @@ type Event struct {
 }
 
 type EventHandler struct {
-	AllocateFunc func(event *Event)
-	EvictFunc    func(event *Event)
+	AllocateFunc   func(event *Event)
+	DeallocateFunc func(event *Event)
 }

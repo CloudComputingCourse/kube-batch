@@ -15,7 +15,7 @@
 # limitations under the License.
 
 # The golang package that we are building.
-readonly KUBE_GO_PACKAGE=github.com/kubernetes-incubator/kube-arbitrator
+readonly KUBE_GO_PACKAGE=github.com/kubernetes-sigs/kube-batch
 readonly KUBE_GOPATH="${GOPATH}"
 
 # The set of server targets that we are only building for Linux
@@ -249,7 +249,7 @@ kube::golang::current_platform() {
   echo "$os/$arch"
 }
 
-# Takes the the platform name ($1) and sets the appropriate golang env variables
+# Takes the platform name ($1) and sets the appropriate golang env variables
 # for that platform.
 kube::golang::set_platform_envs() {
   [[ -n ${1-} ]] || {
