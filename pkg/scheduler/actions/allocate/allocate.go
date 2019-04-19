@@ -75,7 +75,7 @@ func (alloc *allocateAction) Initialize() {}
 
 func addJobProperty(job *api.JobInfo) *api.JobInfo {
 	for _, task := range job.TaskStatusIndex[api.Pending] {
-		jobID, _ := strconv.ParseInt(job.Name[4 :], 10, 64)
+		jobID, _ := strconv.ParseInt(job.Name[3 :], 10, 64)
 		job.ID = int(jobID)
 		job.Trace = task.Pod.ObjectMeta.Labels["trace"]
 		job.Type = task.Pod.ObjectMeta.Labels["type"]
