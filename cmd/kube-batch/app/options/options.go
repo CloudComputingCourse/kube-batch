@@ -25,7 +25,7 @@ import (
 
 const (
 	defaultSchedulerName   = "kube-batch"
-	defaultSchedulerPeriod = time.Second
+	defaultSchedulerPeriod = 10 * time.Millisecond
 	defaultQueue           = "default"
 	defaultListenAddress   = ":8080"
 )
