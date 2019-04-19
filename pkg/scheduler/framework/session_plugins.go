@@ -198,22 +198,6 @@ func (ssn *Session) JobValid(obj interface{}) *api.ValidateResult {
 }
 
 func (ssn *Session) JobOrderFn(l, r interface{}) bool {
-	for _, tier := range ssn.Tiers {
-		for _, plugin := range tier.Plugins {
-			if !isEnabled(plugin.EnabledJobOrder) {
-				continue
-			}
-			jof, found := ssn.jobOrderFns[plugin.Name]
-			if !found {
-				continue
-			}
-			if j := jof(l, r); j != 0 {
-				return j < 0
-			}
-		}
-	}
-
-	// If no job order funcs, order job by CreationTimestamp first, then by UID.
 	lv := l.(*api.JobInfo)
 	rv := r.(*api.JobInfo)
 	if lv.CreationTimestamp.Equal(&rv.CreationTimestamp) {
